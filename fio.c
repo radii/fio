@@ -429,7 +429,7 @@ static void do_verify(struct thread_data *td)
 			continue;
 		if (fio_io_sync(td, f))
 			break;
-		if (file_invalidate_cache(td, f))
+		if (td->o.invalidate_cache && file_invalidate_cache(td, f))
 			break;
 	}
 
