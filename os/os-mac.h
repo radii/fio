@@ -20,7 +20,6 @@
 #define FIO_HAVE_POSIXAIO
 #define FIO_HAVE_CLOCK_MONOTONIC
 #define FIO_USE_GENERIC_BDEV_SIZE
-#define FIO_USE_GENERIC_RAND
 
 #define OS_MAP_ANON		MAP_ANON
 
@@ -121,4 +120,18 @@ static inline unsigned long long os_phys_mem(void)
 	sysctl(mib, 2, &mem, &len, NULL, 0);
 	return mem;
 }
+
+static inline void os_random_seed(unsigned long seed, os_random_state_t *rs)
+{
+	srand48_r(seed, rs);
+}
+
+static inline long os_random_long(os_random_state_t *rs)
+{
+	long val;
+
+	lrand48_r(rs, &val);
+	return val;
+}
+
 #endif
