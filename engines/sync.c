@@ -30,7 +30,7 @@ static int fio_syncio_prep(struct thread_data *td, struct io_u *io_u)
 {
 	struct fio_file *f = io_u->file;
 
-	if (ddir_sync(io_u->ddir))
+	if (!ddir_rw(io_u->ddir))
 		return 0;
 
 	if (f->file_pos != -1ULL && f->file_pos == io_u->offset)
@@ -46,7 +46,7 @@ static int fio_syncio_prep(struct thread_data *td, struct io_u *io_u)
 
 static int fio_io_end(struct thread_data *td, struct io_u *io_u, int ret)
 {
-	if (io_u->file && ret >= 0)
+	if (io_u->file && ret >= 0 && ddir_rw(io_u->ddir))
 		io_u->file->file_pos = io_u->offset + ret;
 
 	if (ret != (int) io_u->xfer_buflen) {
@@ -141,11 +141,11 @@ static int fio_vsyncio_append(struct thread_data *td, struct io_u *io_u)
 }
 
 static void fio_vsyncio_set_iov(struct syncio_data *sd, struct io_u *io_u,
-				int index)
+				int idx)
 {
-	sd->io_us[index] = io_u;
-	sd->iovecs[index].iov_base = io_u->xfer_buf;
-	sd->iovecs[index].iov_len = io_u->xfer_buflen;
+	sd->io_us[idx] = io_u;
+	sd->iovecs[idx].iov_base = io_u->xfer_buf;
+	sd->iovecs[idx].iov_len = io_u->xfer_buflen;
 	sd->last_offset = io_u->offset + io_u->xfer_buflen;
 	sd->last_file = io_u->file;
 	sd->last_ddir = io_u->ddir;

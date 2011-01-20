@@ -8,7 +8,6 @@
 #include <ctype.h>
 #include <string.h>
 #include <errno.h>
-#include <getopt.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/types.h>
@@ -21,7 +20,9 @@
 #include "verify.h"
 #include "profile.h"
 
-static char fio_version_string[] = "fio 1.42";
+#include "lib/getopt.h"
+
+static char fio_version_string[] = "fio 1.50-rc3";
 
 #define FIO_RANDSEED		(0xb1899bedUL)
 
@@ -40,6 +41,7 @@ FILE *f_out = NULL;
 FILE *f_err = NULL;
 char *job_section = NULL;
 char *exec_profile = NULL;
+int warnings_fatal = 0;
 
 int write_bw_log = 0;
 int read_only = 0;
@@ -52,6 +54,8 @@ static int prev_group_jobs;
 unsigned long fio_debug = 0;
 unsigned int fio_debug_jobno = -1;
 unsigned int *fio_debug_jobp = NULL;
+
+static char cmd_optstr[256];
 
 /*
  * Command line options. These will contain the above, plus a few
@@ -134,6 +138,11 @@ static struct option l_opts[FIO_NR_OPTIONS] = {
 		.val		= 'p',
 	},
 	{
+		.name		= "warnings-fatal",
+		.has_arg	= no_argument,
+		.val		= 'w',
+	},
+	{
 		.name		= NULL,
 	},
 };
@@ -157,8 +166,11 @@ static struct thread_data *get_new_job(int global, struct thread_data *parent)
 
 	if (global)
 		return &def_thread;
-	if (thread_number >= max_jobs)
+	if (thread_number >= max_jobs) {
+		log_err("error: maximum number of jobs (%d) reached.\n",
+				max_jobs);
 		return NULL;
+	}
 
 	td = &threads[thread_number++];
 	*td = *parent;
@@ -192,6 +204,8 @@ static int __setup_rate(struct thread_data *td, enum fio_ddir ddir)
 {
 	unsigned int bs = td->o.min_bs[ddir];
 	unsigned long long bytes_per_sec;
+
+	assert(ddir_rw(ddir));
 
 	if (td->o.rate[ddir])
 		bytes_per_sec = td->o.rate[ddir];
@@ -234,6 +248,7 @@ static int fixed_block_size(struct thread_options *o)
 static int fixup_options(struct thread_data *td)
 {
 	struct thread_options *o = &td->o;
+	int ret = 0;
 
 #ifndef FIO_HAVE_PSHARED_MUTEX
 	if (!o->use_thread) {
@@ -241,6 +256,7 @@ static int fixup_options(struct thread_data *td)
 			 " mutexes, forcing use of threads. Use the 'thread'"
 			 " option to get rid of this warning.\n");
 		o->use_thread = 1;
+		ret = warnings_fatal;
 	}
 #endif
 
@@ -248,6 +264,7 @@ static int fixup_options(struct thread_data *td)
 		log_err("fio: read iolog overrides write_iolog\n");
 		free(o->write_iolog_file);
 		o->write_iolog_file = NULL;
+		ret = warnings_fatal;
 	}
 
 	/*
@@ -286,6 +303,7 @@ static int fixup_options(struct thread_data *td)
 	    !o->norandommap) {
 		log_err("fio: Any use of blockalign= turns off randommap\n");
 		o->norandommap = 1;
+		ret = warnings_fatal;
 	}
 
 	if (!o->file_size_high)
@@ -296,6 +314,7 @@ static int fixup_options(struct thread_data *td)
 		log_err("fio: norandommap given for variable block sizes, "
 			"verify disabled\n");
 		o->verify = VERIFY_NONE;
+		ret = warnings_fatal;
 	}
 	if (o->bs_unaligned && (o->odirect || td->io_ops->flags & FIO_RAWIO))
 		log_err("fio: bs_unaligned may not work with raw io\n");
@@ -337,28 +356,38 @@ static int fixup_options(struct thread_data *td)
 	    ((o->ratemin[0] + o->ratemin[1]) && (o->rate_iops_min[0] +
 		o->rate_iops_min[1]))) {
 		log_err("fio: rate and rate_iops are mutually exclusive\n");
-		return 1;
+		ret = 1;
 	}
 	if ((o->rate[0] < o->ratemin[0]) || (o->rate[1] < o->ratemin[1]) ||
 	    (o->rate_iops[0] < o->rate_iops_min[0]) ||
 	    (o->rate_iops[1] < o->rate_iops_min[1])) {
 		log_err("fio: minimum rate exceeds rate\n");
-		return 1;
+		ret = 1;
 	}
 
 	if (!o->timeout && o->time_based) {
 		log_err("fio: time_based requires a runtime/timeout setting\n");
 		o->time_based = 0;
+		ret = warnings_fatal;
 	}
 
 	if (o->fill_device && !o->size)
 		o->size = -1ULL;
 
-	if (td_rw(td) && o->verify != VERIFY_NONE)
-		log_info("fio: mixed read/write workload with verify. May not "
-		 "work as expected, unless you pre-populated the file\n");
-
 	if (o->verify != VERIFY_NONE) {
+		if (td_rw(td)) {
+			log_info("fio: mixed read/write workload with verify. "
+				"May not work as expected, unless you "
+				"pre-populated the file\n");
+			ret = warnings_fatal;
+		}
+		if (td_write(td) && o->do_verify && o->numjobs > 1) {
+			log_info("Multiple writers may overwrite blocks that "
+				"belong to other jobs. This can cause "
+				"verification failures.\n");
+			ret = warnings_fatal;
+		}
+
 		o->refill_buffers = 1;
 		if (o->max_bs[DDIR_WRITE] != o->min_bs[DDIR_WRITE] &&
 		    !o->verify_interval)
@@ -367,9 +396,11 @@ static int fixup_options(struct thread_data *td)
 
 	if (o->pre_read) {
 		o->invalidate_cache = 0;
-		if (td->io_ops->flags & FIO_PIPEIO)
+		if (td->io_ops->flags & FIO_PIPEIO) {
 			log_info("fio: cannot pre-read files with an IO engine"
 				 " that isn't seekable. Pre-read disabled.\n");
+			ret = warnings_fatal;
+		}
 	}
 
 #ifndef FIO_HAVE_FDATASYNC
@@ -380,10 +411,11 @@ static int fixup_options(struct thread_data *td)
 			 " this warning\n");
 		o->fsync_blocks = o->fdatasync_blocks;
 		o->fdatasync_blocks = 0;
+		ret = warnings_fatal;
 	}
 #endif
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -428,7 +460,9 @@ static int exists_and_not_file(const char *filename)
 	if (lstat(filename, &sb) == -1)
 		return 0;
 
-	if (S_ISREG(sb.st_mode))
+	/* \\.\ is the device namespace in Windows, where every file
+	 * is a device node */
+	if (S_ISREG(sb.st_mode) && strncmp(filename, "\\\\.\\", 4) != 0)
 		return 0;
 
 	return 1;
@@ -444,6 +478,7 @@ void td_fill_rand_seeds(struct thread_data *td)
 		os_random_seed(td->rand_seeds[3], &td->next_file_state);
 
 	os_random_seed(td->rand_seeds[5], &td->file_size_state);
+	os_random_seed(td->rand_seeds[6], &td->trim_state);
 
 	if (!td_random(td))
 		return;
@@ -557,7 +592,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num)
 	td->ts.slat_stat[0].min_val = td->ts.slat_stat[1].min_val = ULONG_MAX;
 	td->ts.lat_stat[0].min_val = td->ts.lat_stat[1].min_val = ULONG_MAX;
 	td->ts.bw_stat[0].min_val = td->ts.bw_stat[1].min_val = ULONG_MAX;
-	td->ddir_seq_nr = td->o.ddir_seq_nr + 1;
+	td->ddir_seq_nr = td->o.ddir_seq_nr;
 
 	if ((td->o.stonewall || td->o.new_group) && prev_group_jobs) {
 		prev_group_jobs = 0;
@@ -954,7 +989,6 @@ static int setup_thread_area(void)
 
 static void usage(const char *name)
 {
-	printf("%s\n", fio_version_string);
 	printf("%s [options] [job options] <job file(s)>\n", name);
 	printf("\t--debug=options\tEnable debug logging\n");
 	printf("\t--output\tWrite output to file\n");
@@ -974,6 +1008,7 @@ static void usage(const char *name)
 	printf("\t--section=name\tOnly run specified section in job file\n");
 	printf("\t--alloc-size=kb\tSet smalloc pool to this size in kb"
 		" (def 1024)\n");
+	printf("\t--warnings-fatal Fio parser warnings are fatal\n");
 	printf("\nFio was written by Jens Axboe <jens.axboe@oracle.com>");
 	printf("\n                   Jens Axboe <jaxboe@fusionio.com>\n");
 }
@@ -1004,8 +1039,6 @@ static int set_debug(const char *string)
 	int i;
 
 	if (!strcmp(string, "?") || !strcmp(string, "help")) {
-		int i;
-
 		log_info("fio: dumping debug options:");
 		for (i = 0; debug_levels[i].name; i++) {
 			dl = &debug_levels[i];
@@ -1060,12 +1093,32 @@ static int set_debug(const char *string)
 }
 #endif
 
+static void fio_options_fill_optstring(void)
+{
+	char *ostr = cmd_optstr;
+	int i, c;
+
+	c = i = 0;
+	while (l_opts[i].name) {
+		ostr[c++] = l_opts[i].val;
+		if (l_opts[i].has_arg == required_argument)
+			ostr[c++] = ':';
+		else if (l_opts[i].has_arg == optional_argument) {
+			ostr[c++] = ':';
+			ostr[c++] = ':';
+		}
+		i++;
+	}
+	ostr[c] = '\0';
+}
+
 static int parse_cmd_line(int argc, char *argv[])
 {
 	struct thread_data *td = NULL;
 	int c, ini_idx = 0, lidx, ret = 0, do_exit = 0, exit_val = 0;
+	char *ostr = cmd_optstr;
 
-	while ((c = getopt_long_only(argc, argv, "", l_opts, &lidx)) != -1) {
+	while ((c = getopt_long_only(argc, argv, ostr, l_opts, &lidx)) != -1) {
 		switch (c) {
 		case 'a':
 			smalloc_pool_size = atoi(optarg);
@@ -1102,7 +1155,7 @@ static int parse_cmd_line(int argc, char *argv[])
 			read_only = 1;
 			break;
 		case 'v':
-			printf("%s\n", fio_version_string);
+			/* already being printed, just quit */
 			exit(0);
 		case 'e':
 			if (!strcmp("always", optarg))
@@ -1159,6 +1212,9 @@ static int parse_cmd_line(int argc, char *argv[])
 			ret = fio_cmd_option_parse(td, opt, val);
 			break;
 		}
+		case 'w':
+			warnings_fatal = 1;
+			break;
 		default:
 			do_exit++;
 			exit_val = 1;
@@ -1193,6 +1249,9 @@ int parse_options(int argc, char *argv[])
 	f_out = stdout;
 	f_err = stderr;
 
+	log_info("%s\n", fio_version_string);
+
+	fio_options_fill_optstring();
 	fio_options_dup_and_init(l_opts);
 
 	if (setup_thread_area())
@@ -1219,7 +1278,7 @@ int parse_options(int argc, char *argv[])
 		if (exec_profile)
 			return 0;
 
-		log_err("No jobs defined(s)\n\n");
+		log_err("No jobs(s) defined\n\n");
 		usage(argv[0]);
 		return 1;
 	}

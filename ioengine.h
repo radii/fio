@@ -9,6 +9,8 @@ enum {
 	IO_U_F_FREE_DEF		= 1 << 2,
 	IO_U_F_IN_CUR_DEPTH	= 1 << 3,
 	IO_U_F_BUSY_OK		= 1 << 4,
+	IO_U_F_TRIMMED		= 1 << 5,
+	IO_U_F_BARRIER		= 1 << 6,
 };
 
 /*
@@ -31,6 +33,9 @@ struct io_u {
 #ifdef FIO_HAVE_SOLARISAIO
 		aio_result_t resultp;
 #endif
+#ifdef FIO_HAVE_BINJECT
+		struct b_user_cmd buc;
+#endif
 		void *mmap_data;
 	};
 	struct timeval start_time;
@@ -42,6 +47,11 @@ struct io_u {
 	void *buf;
 	unsigned long buflen;
 	unsigned long long offset;
+
+	/*
+	 * Initial seed for generating the buffer contents
+	 */
+	unsigned long rand_seed;
 
 	/*
 	 * IO engine state, may be different from above when we get
@@ -120,8 +130,10 @@ enum fio_ioengine_flags {
 	FIO_NODISKUTIL  = 1 << 4,       /* diskutil can't handle filename */
 	FIO_UNIDIR	= 1 << 5,	/* engine is uni-directional */
 	FIO_NOIO	= 1 << 6,	/* thread does only pseudo IO */
-	FIO_SIGQUIT	= 1 << 7,	/* needs SIGQUIT to exit */
+	FIO_SIGTERM	= 1 << 7,	/* needs SIGTERM to exit */
 	FIO_PIPEIO	= 1 << 8,	/* input/output no seekable */
+	FIO_BARRIER	= 1 << 9,	/* engine supports barriers */
+	FIO_MEMALIGN	= 1 << 10,	/* engine wants aligned memory */
 };
 
 /*

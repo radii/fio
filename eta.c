@@ -161,12 +161,13 @@ static int thread_eta(struct thread_data *td)
 		 * if given, otherwise assume it'll run at the specified rate.
 		 */
 		if (td->o.timeout) {
-			t_eta = td->o.timeout + td->o.start_delay;
+			t_eta = td->o.timeout + td->o.start_delay +
+					td->o.ramp_time;
 
 			if (in_ramp_time(td)) {
 				unsigned long ramp_left;
 
-				ramp_left = mtime_since_now(&td->start);
+				ramp_left = mtime_since_now(&td->epoch);
 				ramp_left = (ramp_left + 999) / 1000;
 				if (ramp_left <= t_eta)
 					t_eta -= ramp_left;
@@ -328,7 +329,11 @@ void print_thread_status(void)
 	}
 
 	disp_time = mtime_since(&disp_prev_time, &now);
-	if (disp_time < 1000)
+
+	/*
+	 * Allow a little slack, the target is to print it every 1000 msecs
+	 */
+	if (disp_time < 900)
 		return;
 
 	calc_rate(disp_time, io_bytes, disp_io_bytes, rate);
@@ -386,7 +391,7 @@ void print_thread_status(void)
 	fflush(stdout);
 }
 
-void print_status_init(int thread_number)
+void print_status_init(int thr_number)
 {
-	run_str[thread_number] = 'P';
+	run_str[thr_number] = 'P';
 }

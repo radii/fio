@@ -7,6 +7,8 @@
 #include <sys/fcntl.h>
 #include <sys/pset.h>
 
+#include "../file.h"
+
 #define FIO_HAVE_POSIXAIO
 #define FIO_HAVE_SOLARISAIO
 #define FIO_HAVE_FALLOCATE
@@ -26,7 +28,7 @@ struct solaris_rand_seed {
 typedef psetid_t os_cpu_mask_t;
 typedef struct solaris_rand_seed os_random_state_t;
 
-static inline int blockdev_invalidate_cache(int fd)
+static inline int blockdev_invalidate_cache(struct fio_file *f)
 {
 	return EINVAL;
 }

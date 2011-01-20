@@ -10,7 +10,7 @@
 #include "fio.h"
 #include "blktrace_api.h"
 
-#define TRACE_FIFO_SIZE	65536
+#define TRACE_FIFO_SIZE	8192
 
 /*
  * fifo refill frontend, to avoid reading data in trace sized bites
@@ -97,7 +97,8 @@ int is_blktrace(const char *filename)
 	return 0;
 }
 
-static int lookup_device(char *path, unsigned int maj, unsigned int min)
+static int lookup_device(struct thread_data *td, char *path, unsigned int maj,
+			 unsigned int min)
 {
 	struct dirent *dir;
 	struct stat st;
@@ -121,7 +122,7 @@ static int lookup_device(char *path, unsigned int maj, unsigned int min)
 		}
 
 		if (S_ISDIR(st.st_mode)) {
-			found = lookup_device(full_path, maj, min);
+			found = lookup_device(td, full_path, maj, min);
 			if (found) {
 				strcpy(path, full_path);
 				break;
@@ -130,6 +131,20 @@ static int lookup_device(char *path, unsigned int maj, unsigned int min)
 
 		if (!S_ISBLK(st.st_mode))
 			continue;
+
+		/*
+		 * If replay_redirect is set then always return this device
+		 * upon lookup which overrides the device lookup based on
+		 * major minor in the actual blktrace
+		 */
+		if (td->o.replay_redirect) {
+			dprint(FD_BLKTRACE, "device lookup: %d/%d\n overridden"
+					" with: %s", maj, min,
+					td->o.replay_redirect);
+			strcpy(path, td->o.replay_redirect);
+			found = 1;
+			break;
+		}
 
 		if (maj == major(st.st_rdev) && min == minor(st.st_rdev)) {
 			dprint(FD_BLKTRACE, "device lookup: %d/%d\n", maj, min);
@@ -153,6 +168,7 @@ static void trace_add_open_event(struct thread_data *td, int fileno)
 	struct io_piece *ipo;
 
 	ipo = calloc(1, sizeof(*ipo));
+	init_ipo(ipo);
 
 	ipo->ddir = DDIR_INVAL;
 	ipo->fileno = fileno;
@@ -183,11 +199,11 @@ static void trace_add_file(struct thread_data *td, __u32 device)
 			return;
 
 	strcpy(dev, "/dev");
-	if (lookup_device(dev, maj, min)) {
+	if (lookup_device(td, dev, maj, min)) {
 		int fileno;
 
 		dprint(FD_BLKTRACE, "add devices %s\n", dev);
-		fileno = add_file(td, dev);
+		fileno = add_file_exclusive(td, dev);
 		trace_add_open_event(td, fileno);
 	}
 }
@@ -200,8 +216,8 @@ static void store_ipo(struct thread_data *td, unsigned long long offset,
 {
 	struct io_piece *ipo = malloc(sizeof(*ipo));
 
-	memset(ipo, 0, sizeof(*ipo));
-	INIT_FLIST_HEAD(&ipo->list);
+	init_ipo(ipo);
+
 	/*
 	 * the 512 is wrong here, it should be the hardware sector size...
 	 */
@@ -228,10 +244,40 @@ static void handle_trace_notify(struct blk_io_trace *t)
 	case BLK_TN_TIMESTAMP:
 		printf("got timestamp notify: %x, %d\n", t->action, t->pid);
 		break;
+	case BLK_TN_MESSAGE:
+		break;
 	default:
 		dprint(FD_BLKTRACE, "unknown trace act %x\n", t->action);
 		break;
 	}
+}
+
+static void handle_trace_discard(struct thread_data *td, struct blk_io_trace *t,
+				 unsigned long long ttime, unsigned long *ios)
+{
+	struct io_piece *ipo = malloc(sizeof(*ipo));
+
+	init_ipo(ipo);
+	trace_add_file(td, t->device);
+
+	ios[DDIR_WRITE]++;
+	td->o.size += t->bytes;
+
+	memset(ipo, 0, sizeof(*ipo));
+	INIT_FLIST_HEAD(&ipo->list);
+
+	/*
+	 * the 512 is wrong here, it should be the hardware sector size...
+	 */
+	ipo->offset = t->sector * 512;
+	ipo->len = t->bytes;
+	ipo->delay = ttime / 1000;
+	ipo->ddir = DDIR_TRIM;
+
+	dprint(FD_BLKTRACE, "store discard, off=%llu, len=%lu, delay=%lu\n",
+							ipo->offset, ipo->len,
+							ipo->delay);
+	queue_io_piece(td, ipo);
 }
 
 static void handle_trace_fs(struct thread_data *td, struct blk_io_trace *t,
@@ -267,6 +313,8 @@ static void handle_trace(struct thread_data *td, struct blk_io_trace *t,
 
 	if (t->action & BLK_TC_ACT(BLK_TC_NOTIFY))
 		handle_trace_notify(t);
+	else if (t->action & BLK_TC_ACT(BLK_TC_DISCARD))
+		handle_trace_discard(td, t, ttime, ios);
 	else
 		handle_trace_fs(td, t, ttime, ios, bs);
 }
@@ -341,8 +389,16 @@ int load_blktrace(struct thread_data *td, const char *filename)
 				delay = t.time - ttime;
 			if ((t.action & BLK_TC_ACT(BLK_TC_WRITE)) && read_only)
 				skipped_writes++;
-			else
+			else {
+				/*
+				 * set delay to zero if no_stall enabled for
+				 * fast replay
+				 */
+				if (td->o.no_stall)
+					delay = 0;
+
 				handle_trace(td, &t, delay, ios, rw_bs);
+			}
 
 			ttime = t.time;
 			cpu = t.cpu;

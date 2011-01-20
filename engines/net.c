@@ -223,7 +223,7 @@ static int fio_netio_splice_out(struct thread_data *td, struct io_u *io_u)
 static int fio_netio_send(struct thread_data *td, struct io_u *io_u)
 {
 	struct netio_data *nd = td->io_ops->data;
-	int ret, flags = MSG_DONTWAIT;
+	int ret, flags = OS_MSG_DONTWAIT;
 
 	do {
 		if (nd->net_protocol == IPPROTO_UDP) {
@@ -251,7 +251,7 @@ static int fio_netio_send(struct thread_data *td, struct io_u *io_u)
 		if (ret <= 0)
 			break;
 
-		flags &= ~MSG_DONTWAIT;
+		flags &= ~OS_MSG_DONTWAIT;
 	} while (1);
 
 	return ret;
@@ -276,7 +276,7 @@ static int is_udp_close(struct io_u *io_u, int len)
 static int fio_netio_recv(struct thread_data *td, struct io_u *io_u)
 {
 	struct netio_data *nd = td->io_ops->data;
-	int ret, flags = MSG_DONTWAIT;
+	int ret, flags = OS_MSG_DONTWAIT;
 
 	do {
 		if (nd->net_protocol == IPPROTO_UDP) {
@@ -299,7 +299,7 @@ static int fio_netio_recv(struct thread_data *td, struct io_u *io_u)
 		ret = poll_wait(td, io_u->file->fd, POLLIN);
 		if (ret <= 0)
 			break;
-		flags &= ~MSG_DONTWAIT;
+		flags &= ~OS_MSG_DONTWAIT;
 		flags |= MSG_WAITALL;
 	} while (1);
 
@@ -633,7 +633,7 @@ static struct ioengine_ops ioengine_splice = {
 	.open_file	= fio_netio_open_file,
 	.close_file	= generic_close_file,
 	.flags		= FIO_SYNCIO | FIO_DISKLESSIO | FIO_UNIDIR |
-			  FIO_SIGQUIT | FIO_PIPEIO,
+			  FIO_SIGTERM | FIO_PIPEIO,
 };
 #endif
 
@@ -648,7 +648,7 @@ static struct ioengine_ops ioengine_rw = {
 	.open_file	= fio_netio_open_file,
 	.close_file	= fio_netio_close_file,
 	.flags		= FIO_SYNCIO | FIO_DISKLESSIO | FIO_UNIDIR |
-			  FIO_SIGQUIT | FIO_PIPEIO,
+			  FIO_SIGTERM | FIO_PIPEIO,
 };
 
 static void fio_init fio_netio_register(void)

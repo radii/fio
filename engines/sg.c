@@ -166,7 +166,7 @@ static int fio_sgio_ioctl_doio(struct thread_data *td,
 	return FIO_Q_COMPLETED;
 }
 
-static int fio_sgio_rw_doio(struct fio_file *f, struct io_u *io_u, int sync)
+static int fio_sgio_rw_doio(struct fio_file *f, struct io_u *io_u, int do_sync)
 {
 	struct sg_io_hdr *hdr = &io_u->hdr;
 	int ret;
@@ -175,7 +175,7 @@ static int fio_sgio_rw_doio(struct fio_file *f, struct io_u *io_u, int sync)
 	if (ret < 0)
 		return ret;
 
-	if (sync) {
+	if (do_sync) {
 		ret = read(f->fd, hdr, sizeof(*hdr));
 		if (ret < 0)
 			return ret;
@@ -185,14 +185,14 @@ static int fio_sgio_rw_doio(struct fio_file *f, struct io_u *io_u, int sync)
 	return FIO_Q_QUEUED;
 }
 
-static int fio_sgio_doio(struct thread_data *td, struct io_u *io_u, int sync)
+static int fio_sgio_doio(struct thread_data *td, struct io_u *io_u, int do_sync)
 {
 	struct fio_file *f = io_u->file;
 
 	if (f->filetype == FIO_TYPE_BD)
 		return fio_sgio_ioctl_doio(td, f, io_u);
 
-	return fio_sgio_rw_doio(f, io_u, sync);
+	return fio_sgio_rw_doio(f, io_u, do_sync);
 }
 
 static int fio_sgio_prep(struct thread_data *td, struct io_u *io_u)
@@ -274,17 +274,16 @@ static struct io_u *fio_sgio_event(struct thread_data *td, int event)
 static int fio_sgio_get_bs(struct thread_data *td, unsigned int *bs)
 {
 	struct sgio_data *sd = td->io_ops->data;
-	struct io_u *io_u;
+	struct io_u io_u;
 	struct sg_io_hdr *hdr;
 	unsigned char buf[8];
 	int ret;
 
-	io_u = __get_io_u(td);
-	io_u->file = td->files[0];
-	assert(io_u);
+	memset(&io_u, 0, sizeof(io_u));
+	io_u.file = td->files[0];
 
-	hdr = &io_u->hdr;
-	sgio_hdr_init(sd, hdr, io_u, 0);
+	hdr = &io_u.hdr;
+	sgio_hdr_init(sd, hdr, &io_u, 0);
 	memset(buf, 0, sizeof(buf));
 
 	hdr->cmdp[0] = 0x25;
@@ -292,14 +291,11 @@ static int fio_sgio_get_bs(struct thread_data *td, unsigned int *bs)
 	hdr->dxferp = buf;
 	hdr->dxfer_len = sizeof(buf);
 
-	ret = fio_sgio_doio(td, io_u, 1);
-	if (ret) {
-		put_io_u(td, io_u);
+	ret = fio_sgio_doio(td, &io_u, 1);
+	if (ret)
 		return ret;
-	}
 
 	*bs = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
-	put_io_u(td, io_u);
 	return 0;
 }
 
@@ -420,7 +416,7 @@ static struct ioengine_ops ioengine = {
  */
 static int fio_sgio_init(struct thread_data fio_unused *td)
 {
-	fprintf(stderr, "fio: ioengine sg not available\n");
+	log_err("fio: ioengine sg not available\n");
 	return 1;
 }
 

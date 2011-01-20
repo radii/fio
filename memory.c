@@ -63,7 +63,7 @@ int fio_pin_memory(void)
 
 static int alloc_mem_shm(struct thread_data *td, unsigned int total_mem)
 {
-	int flags = IPC_CREAT | SHM_R | SHM_W;
+	int flags = IPC_CREAT | S_IRUSR | S_IWUSR;
 
 	if (td->o.mem_type == MEM_SHMHUGE) {
 		unsigned long mask = td->o.hugepage_size - 1;
@@ -181,7 +181,7 @@ static void free_mem_malloc(struct thread_data *td)
 }
 
 /*
- * Setup the buffer area we need for io.
+ * Set up the buffer area we need for io.
  */
 int allocate_io_mem(struct thread_data *td)
 {
@@ -193,7 +193,8 @@ int allocate_io_mem(struct thread_data *td)
 
 	total_mem = td->orig_buffer_size;
 
-	if (td->o.odirect || td->o.mem_align) {
+	if (td->o.odirect || td->o.mem_align ||
+	    (td->io_ops->flags & FIO_MEMALIGN)) {
 		total_mem += page_mask;
 		if (td->o.mem_align && td->o.mem_align > page_size)
 			total_mem += td->o.mem_align - page_size;

@@ -178,7 +178,7 @@ static int find_next_zero(int word, int start)
 
 static int add_pool(struct pool *pool, unsigned int alloc_size)
 {
-	int fd, bitmap_blocks, ret;
+	int fd, bitmap_blocks;
 	char file[] = "/tmp/.fio_smalloc.XXXXXX";
 	void *ptr;
 
@@ -203,11 +203,7 @@ static int add_pool(struct pool *pool, unsigned int alloc_size)
 	pool->free_blocks = bitmap_blocks * SMALLOC_BPB;
 
 #ifdef FIO_HAVE_FALLOCATE
-	ret = posix_fallocate(fd, 0, alloc_size);
-	if (ret > 0) {
-		fprintf(stderr, "posix_fallocate pool file failed: %s\n", strerror(ret));
-		goto out_unlink;
-	}
+	posix_fallocate(fd, 0, alloc_size);
 #endif
 
 	if (ftruncate(fd, alloc_size) < 0)

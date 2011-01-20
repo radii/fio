@@ -271,12 +271,14 @@ filename=str	Fio normally makes up a filename based on the job name,
 		can specify a number of files by separating the names with a
 		':' colon. So if you wanted a job to open /dev/sda and /dev/sdb
 		as the two working files, you would use
-		filename=/dev/sda:/dev/sdb. If the wanted filename does need to
-		include a colon, then escape that with a '\' character. For
-		instance, if the filename is "/dev/dsk/foo@3,0:c", then you would
-		use filename="/dev/dsk/foo@3,0\:c". '-' is a reserved name,
-		meaning stdin or stdout. Which of the two depends on the read/write
-		direction set.
+		filename=/dev/sda:/dev/sdb. On Windows, disk devices are accessed
+		as \\.\PhysicalDrive0 for the first device, \\.\PhysicalDrive1
+		for the second etc.  If the wanted filename does need to 
+		include a colon, then escape that with a '\' character. 
+		For instance, if the filename is "/dev/dsk/foo@3,0:c", 
+		then you would use filename="/dev/dsk/foo@3,0\:c". 
+		'-' is a reserved name, meaning stdin or stdout. Which of the 
+		two depends on the read/write direction set.
 
 opendir=str	Tell fio to recursively add any file it can find in this
 		directory and down the file system tree.
@@ -349,7 +351,8 @@ randrepeat=bool	For random IO workloads, seed the generator in a predictable
 fallocate=bool	By default, fio will use fallocate() to advise the system
 		of the size of the file we are going to write. This can be
 		turned off with fallocate=0. May not be available on all
-		supported platforms.
+		supported platforms.  If using ZFS on Solaris this must be
+		set to 0 because ZFS doesn't support it.
 
 fadvise_hint=bool By default, fio will use fadvise() to advise the kernel
 		on what IO patterns it is likely to issue. Sometimes you
@@ -375,7 +378,11 @@ filesize=int	Individual file sizes. May be a range, in which case fio
 fill_device=bool Sets size to something really large and waits for ENOSPC (no
 		space left on device) as the terminating condition. Only makes
                 sense with sequential write. For a read workload, the mount
-		point will be filled first then IO started on the result.
+		point will be filled first then IO started on the result. This
+		option doesn't make sense if operating on a raw device node,
+		since the size of that is already known by the file system.
+		Additionally, writing beyond end-of-device will not return
+		ENOSPC there.
 
 blocksize=int
 bs=int		The block size used for the io units. Defaults to 4k. Values
@@ -492,6 +499,8 @@ ioengine=str	Defines how the job issues io to the file. The following
 
 			solarisaio Solaris native asynchronous io.
 
+			windowsaio Windows native asynchronous io.
+
 			mmap	File is memory mapped and data copied
 				to/from using memcpy(3).
 
@@ -549,7 +558,14 @@ ioengine=str	Defines how the job issues io to the file. The following
 iodepth=int	This defines how many io units to keep in flight against
 		the file. The default is 1 for each file defined in this
 		job, can be overridden with a larger value for higher
-		concurrency.
+		concurrency. Note that increasing iodepth beyond 1 will not
+		affect synchronous ioengines (except for small degress when
+		verify_async is in use). Even async engines may impose OS
+		restrictions causing the desired depth not to be achieved.
+		This may happen on Linux when using libaio and not setting
+		direct=1, since buffered IO is not async on that OS. Keep an
+		eye on the IO depth distribution in the fio output to verify
+		that the achieved depth is as expected. Default: 1.
 
 iodepth_batch_submit=int
 iodepth_batch=int This defines how many pieces of IO to submit at once.
@@ -574,7 +590,7 @@ iodepth_low=int	The low water mark indicating when to start filling
 		the depth drain down to 4 before starting to fill it again.
 
 direct=bool	If value is true, use non-buffered io. This is usually
-		O_DIRECT.
+		O_DIRECT. Note that ZFS on Solaris doesn't support direct io.
 
 buffered=bool	If value is true, use buffered io. This is the opposite
 		of the 'direct' option. Defaults to true.
@@ -914,6 +930,11 @@ verify_fatal=bool	Normally fio will keep checking the entire contents
 		option is set, fio will exit the job on the first observed
 		failure.
 
+verify_dump=bool	If set, dump the contents of both the original data
+		block and the data block we read off disk to files. This
+		allows later analysis to inspect just what kind of data
+		corruption occurred. On by default.
+
 verify_async=int	Fio will normally verify IO inline from the submitting
 		thread. This option takes an integer describing how many
 		async offload threads to create for IO verification instead,
@@ -935,13 +956,18 @@ verify_backlog=int	Fio will normally verify the written contents of a
 		associated with an IO block in memory, so for large
 		verify workloads, quite a bit of memory would be used up
 		holding this meta data. If this option is enabled, fio
+		will write only N blocks before verifying these blocks.
+
 		will verify the previously written blocks before continuing
 		to write new ones.
 
 verify_backlog_batch=int	Control how many blocks fio will verify
 		if verify_backlog is set. If not set, will default to
 		the value of verify_backlog (meaning the entire queue
-		is read back and verified).
+		is read back and verified).  If verify_backlog_batch is
+		less than verify_backlog then not all blocks will be verified,
+		if verify_backlog_batch is larger than verify_backlog, some
+		blocks will be verified more than once.
 		
 stonewall	Wait for preceeding jobs in the job file to exit, before
 		starting this one. Can be used to insert serialization
@@ -976,7 +1002,8 @@ zoneskip=int	Skip the specified number of bytes when zonesize data has
 		io on zones of a file.
 
 write_iolog=str	Write the issued io patterns to the specified file. See
-		read_iolog.
+		read_iolog.  Specify a separate file for each job, otherwise
+		the iologs will be interspersed and the file may be corrupt.
 
 read_iolog=str	Open an iolog with the specified file name and replay the
 		io patterns it contains. This can be used to store a
@@ -986,6 +1013,31 @@ read_iolog=str	Open an iolog with the specified file name and replay the
 		for how to capture such logging data. For blktrace replay,
 		the file needs to be turned into a blkparse binary data
 		file first (blkparse <device> -o /dev/null -d file_for_fio.bin).
+		
+replay_no_stall=int When replaying I/O with read_iolog the default behavior
+		is to attempt to respect the time stamps within the log and
+		replay them with the appropriate delay between IOPS.  By
+		setting this variable fio will not respect the timestamps and
+		attempt to replay them as fast as possible while still
+		respecting ordering.  The result is the same I/O pattern to a
+		given device, but different timings.
+
+replay_redirect=str While replaying I/O patterns using read_iolog the
+		default behavior is to replay the IOPS onto the major/minor
+		device that each IOP was recorded from.  This is sometimes
+		undesireable because on a different machine those major/minor
+		numbers can map to a different device.  Changing hardware on
+		the same system can also result in a different major/minor
+		mapping.  Replay_redirect causes all IOPS to be replayed onto
+		the single specified device regardless of the device it was
+		recorded from. i.e. replay_redirect=/dev/sdc would cause all
+		IO in the blktrace to be replayed onto /dev/sdc.  This means
+		multiple devices will be replayed onto a single, if the trace
+		contains multiple devices.  If you want multiple devices to be
+		replayed concurrently to multiple redirected devices you must
+		blkparse your trace into separate traces and replay them with
+		independent fio invocations.  Unfortuantely this also breaks
+		the strict time ordering between multiple device accesses.
 
 write_bw_log=str If given, write a bandwidth log of the jobs in this job
 		file. Can be used to store data of the bandwidth of the
@@ -1231,8 +1283,10 @@ For scripted usage where you typically want to generate tables or graphs
 of the results, fio can output the results in a semicolon separated format.
 The format is one long line of values, such as:
 
-2; client1;0;0;1906777;1090804;1790;0;0;0.000000;0.000000;0;0;0.000000;0.000000;929380;1152890;25.510151%;1078276.333333;128948.113404;0;0;0;0;0;0.000000;0.000000;0;0;0.000000;0.000000;0;0;0.000000%;0.000000;0.000000;100.000000%;0.000000%;324;100.0%;0.0%;0.0%;0.0%;0.0%;0.0%;0.0%;100.0%;0.0%;0.0%;0.0%;0.0%;0.0%
-;0.0%;0.0%;0.0%;0.0%;0.0%
+2;card0;0;0;7139336;121836;60004;1;10109;27.932460;116.933948;220;126861;3495.446807;1085.368601;226;126864;3523.635629;1089.012448;24063;99944;50.275485%;59818.274627;5540.657370;7155060;122104;60004;1;8338;29.086342;117.839068;388;128077;5032.488518;1234.785715;391;128085;5061.839412;1236.909129;23436;100928;50.287926%;59964.832030;5644.844189;14.595833%;19.394167%;123706;0;7313;0.1%;0.1%;0.1%;0.1%;0.1%;0.1%;100.0%;0.00%;0.00%;0.00%;0.00%;0.00%;0.00%;0.01%;0.02%;0.05%;0.16%;6.04%;40.40%;52.68%;0.64%;0.01%;0.00%;0.01%;0.00%;0.00%;0.00%;0.00%;0.00%
+A description of this job goes here.
+
+The job description (if provided) follows on a second line.
 
 To enable terse output, use the --minimal command line option. The first
 value is the version of the terse output format. If the output has to
@@ -1256,6 +1310,8 @@ Split up, the format is as follows:
 		Bw: min, max, aggregate percentage of total, mean, deviation
 	CPU usage: user, system, context switches, major faults, minor faults
 	IO depths: <=1, 2, 4, 8, 16, 32, >=64
-	IO latencies: <=2, 4, 10, 20, 50, 100, 250, 500, 750, 1000, >=2000
-	Text description
-
+	IO latencies microseconds: <=2, 4, 10, 20, 50, 100, 250, 500, 750, 1000
+	IO latencies milliseconds: <=2, 4, 10, 20, 50, 100, 250, 500, 750, 1000, 2000, >=2000
+	Additional Info (dependant on continue_on_error, default off): total # errors, first error code 
+	
+	Additional Info (dependant on description being set): Text description

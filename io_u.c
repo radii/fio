@@ -8,6 +8,7 @@
 #include "fio.h"
 #include "hash.h"
 #include "verify.h"
+#include "trim.h"
 #include "lib/rand.h"
 
 struct io_completion_data {
@@ -103,6 +104,8 @@ static unsigned long long last_block(struct thread_data *td, struct fio_file *f,
 	unsigned long long max_blocks;
 	unsigned long long max_size;
 
+	assert(ddir_rw(ddir));
+
 	/*
 	 * Hmm, should we make sure that ->io_size <= ->real_file_size?
 	 */
@@ -123,8 +126,12 @@ static unsigned long long last_block(struct thread_data *td, struct fio_file *f,
 static int get_next_free_block(struct thread_data *td, struct fio_file *f,
 			       enum fio_ddir ddir, unsigned long long *b)
 {
-	unsigned long long min_bs = td->o.rw_min_bs;
+	unsigned long long min_bs = td->o.rw_min_bs, lastb;
 	int i;
+
+	lastb = last_block(td, f, ddir);
+	if (!lastb)
+		return 1;
 
 	i = f->last_free_lookup;
 	*b = (i * BLOCKS_PER_MAP);
@@ -132,7 +139,7 @@ static int get_next_free_block(struct thread_data *td, struct fio_file *f,
 		(*b) * min_bs < f->io_size) {
 		if (f->file_map[i] != (unsigned int) -1) {
 			*b += ffz(f->file_map[i]);
-			if (*b > last_block(td, f, ddir))
+			if (*b > lastb)
 				break;
 			f->last_free_lookup = i;
 			return 0;
@@ -149,14 +156,17 @@ static int get_next_free_block(struct thread_data *td, struct fio_file *f,
 static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 				enum fio_ddir ddir, unsigned long long *b)
 {
-	unsigned long long r;
+	unsigned long long r, lastb;
 	int loops = 5;
+
+	lastb = last_block(td, f, ddir);
+	if (!lastb)
+		return 1;
 
 	do {
 		r = os_random_long(&td->random_state);
 		dprint(FD_RANDOM, "off rand %llu\n", r);
-		*b = (last_block(td, f, ddir) - 1)
-			* (r / ((unsigned long long) OS_RAND_MAX + 1.0));
+		*b = (lastb - 1) * (r / ((unsigned long long) OS_RAND_MAX + 1.0));
 
 		/*
 		 * if we are not maintaining a random map, we are done.
@@ -211,6 +221,8 @@ static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
 static int get_next_seq_block(struct thread_data *td, struct fio_file *f,
 			      enum fio_ddir ddir, unsigned long long *b)
 {
+	assert(ddir_rw(ddir));
+
 	if (f->last_pos < f->real_file_size) {
 		*b = (f->last_pos - f->file_offset) / td->o.min_bs[ddir];
 		return 0;
@@ -224,6 +236,8 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 {
 	struct fio_file *f = io_u->file;
 	int ret;
+
+	assert(ddir_rw(ddir));
 
 	if (rw_seq) {
 		if (td_random(td))
@@ -239,7 +253,8 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 				ret = get_next_rand_block(td, f, ddir, b);
 		} else if (td->o.rw_seq == RW_SEQ_IDENT) {
 			if (f->last_start != -1ULL)
-				*b = (f->last_start - f->file_offset) / td->o.min_bs[ddir];
+				*b = (f->last_start - f->file_offset)
+					/ td->o.min_bs[ddir];
 			else
 				*b = 0;
 			ret = 0;
@@ -264,15 +279,15 @@ static int __get_next_offset(struct thread_data *td, struct io_u *io_u)
 	enum fio_ddir ddir = io_u->ddir;
 	int rw_seq_hit = 0;
 
+	assert(ddir_rw(ddir));
+
 	if (td->o.ddir_seq_nr && !--td->ddir_seq_nr) {
 		rw_seq_hit = 1;
 		td->ddir_seq_nr = td->o.ddir_seq_nr;
 	}
 
-	if (get_next_block(td, io_u, ddir, rw_seq_hit, &b)) {
-		printf("fail\n");
+	if (get_next_block(td, io_u, ddir, rw_seq_hit, &b))
 		return 1;
-	}
 
 	io_u->offset = b * td->o.ba[ddir];
 	if (io_u->offset >= f->io_size) {
@@ -307,6 +322,8 @@ static unsigned int __get_next_buflen(struct thread_data *td, struct io_u *io_u)
 	unsigned int uninitialized_var(buflen);
 	unsigned int minbs, maxbs;
 	long r;
+
+	assert(ddir_rw(ddir));
 
 	minbs = td->o.min_bs[ddir];
 	maxbs = td->o.max_bs[ddir];
@@ -387,6 +404,8 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 	enum fio_ddir odir = ddir ^ 1;
 	struct timeval t;
 	long usec;
+
+	assert(ddir_rw(ddir));
 
 	if (td->rate_pending_usleep[ddir] <= 0)
 		return ddir;
@@ -489,6 +508,17 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 	return td->rwmix_ddir;
 }
 
+static void set_rw_ddir(struct thread_data *td, struct io_u *io_u)
+{
+	io_u->ddir = get_rw_ddir(td);
+
+	if (io_u->ddir == DDIR_WRITE && (td->io_ops->flags & FIO_BARRIER) &&
+	    td->o.barrier_blocks &&
+	   !(td->io_issues[DDIR_WRITE] % td->o.barrier_blocks) &&
+	     td->io_issues[DDIR_WRITE])
+		io_u->flags |= IO_U_F_BARRIER;
+}
+
 void put_file_log(struct thread_data *td, struct fio_file *f)
 {
 	int ret = put_file(td, f);
@@ -531,7 +561,7 @@ void requeue_io_u(struct thread_data *td, struct io_u **io_u)
 	td_io_u_lock(td);
 
 	__io_u->flags |= IO_U_F_FREE;
-	if ((__io_u->flags & IO_U_F_FLIGHT) && !ddir_sync(__io_u->ddir))
+	if ((__io_u->flags & IO_U_F_FLIGHT) && ddir_rw(__io_u->ddir))
 		td->io_issues[__io_u->ddir]--;
 
 	__io_u->flags &= ~IO_U_F_FLIGHT;
@@ -548,12 +578,12 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 	if (td->io_ops->flags & FIO_NOIO)
 		goto out;
 
-	io_u->ddir = get_rw_ddir(td);
+	set_rw_ddir(td, io_u);
 
 	/*
-	 * fsync() or fdatasync(), we are done
+	 * fsync() or fdatasync() or trim etc, we are done
 	 */
-	if (ddir_sync(io_u->ddir))
+	if (!ddir_rw(io_u->ddir))
 		goto out;
 
 	/*
@@ -605,31 +635,31 @@ out:
 
 static void __io_u_mark_map(unsigned int *map, unsigned int nr)
 {
-	int index = 0;
+	int idx = 0;
 
 	switch (nr) {
 	default:
-		index = 6;
+		idx = 6;
 		break;
 	case 33 ... 64:
-		index = 5;
+		idx = 5;
 		break;
 	case 17 ... 32:
-		index = 4;
+		idx = 4;
 		break;
 	case 9 ... 16:
-		index = 3;
+		idx = 3;
 		break;
 	case 5 ... 8:
-		index = 2;
+		idx = 2;
 		break;
 	case 1 ... 4:
-		index = 1;
+		idx = 1;
 	case 0:
 		break;
 	}
 
-	map[index]++;
+	map[idx]++;
 }
 
 void io_u_mark_submit(struct thread_data *td, unsigned int nr)
@@ -646,117 +676,117 @@ void io_u_mark_complete(struct thread_data *td, unsigned int nr)
 
 void io_u_mark_depth(struct thread_data *td, unsigned int nr)
 {
-	int index = 0;
+	int idx = 0;
 
 	switch (td->cur_depth) {
 	default:
-		index = 6;
+		idx = 6;
 		break;
 	case 32 ... 63:
-		index = 5;
+		idx = 5;
 		break;
 	case 16 ... 31:
-		index = 4;
+		idx = 4;
 		break;
 	case 8 ... 15:
-		index = 3;
+		idx = 3;
 		break;
 	case 4 ... 7:
-		index = 2;
+		idx = 2;
 		break;
 	case 2 ... 3:
-		index = 1;
+		idx = 1;
 	case 1:
 		break;
 	}
 
-	td->ts.io_u_map[index] += nr;
+	td->ts.io_u_map[idx] += nr;
 }
 
 static void io_u_mark_lat_usec(struct thread_data *td, unsigned long usec)
 {
-	int index = 0;
+	int idx = 0;
 
 	assert(usec < 1000);
 
 	switch (usec) {
 	case 750 ... 999:
-		index = 9;
+		idx = 9;
 		break;
 	case 500 ... 749:
-		index = 8;
+		idx = 8;
 		break;
 	case 250 ... 499:
-		index = 7;
+		idx = 7;
 		break;
 	case 100 ... 249:
-		index = 6;
+		idx = 6;
 		break;
 	case 50 ... 99:
-		index = 5;
+		idx = 5;
 		break;
 	case 20 ... 49:
-		index = 4;
+		idx = 4;
 		break;
 	case 10 ... 19:
-		index = 3;
+		idx = 3;
 		break;
 	case 4 ... 9:
-		index = 2;
+		idx = 2;
 		break;
 	case 2 ... 3:
-		index = 1;
+		idx = 1;
 	case 0 ... 1:
 		break;
 	}
 
-	assert(index < FIO_IO_U_LAT_U_NR);
-	td->ts.io_u_lat_u[index]++;
+	assert(idx < FIO_IO_U_LAT_U_NR);
+	td->ts.io_u_lat_u[idx]++;
 }
 
 static void io_u_mark_lat_msec(struct thread_data *td, unsigned long msec)
 {
-	int index = 0;
+	int idx = 0;
 
 	switch (msec) {
 	default:
-		index = 11;
+		idx = 11;
 		break;
 	case 1000 ... 1999:
-		index = 10;
+		idx = 10;
 		break;
 	case 750 ... 999:
-		index = 9;
+		idx = 9;
 		break;
 	case 500 ... 749:
-		index = 8;
+		idx = 8;
 		break;
 	case 250 ... 499:
-		index = 7;
+		idx = 7;
 		break;
 	case 100 ... 249:
-		index = 6;
+		idx = 6;
 		break;
 	case 50 ... 99:
-		index = 5;
+		idx = 5;
 		break;
 	case 20 ... 49:
-		index = 4;
+		idx = 4;
 		break;
 	case 10 ... 19:
-		index = 3;
+		idx = 3;
 		break;
 	case 4 ... 9:
-		index = 2;
+		idx = 2;
 		break;
 	case 2 ... 3:
-		index = 1;
+		idx = 1;
 	case 0 ... 1:
 		break;
 	}
 
-	assert(index < FIO_IO_U_LAT_M_NR);
-	td->ts.io_u_lat_m[index]++;
+	assert(idx < FIO_IO_U_LAT_M_NR);
+	td->ts.io_u_lat_m[idx]++;
 }
 
 static void io_u_mark_latency(struct thread_data *td, unsigned long usec)
@@ -951,6 +981,7 @@ again:
 	if (io_u) {
 		assert(io_u->flags & IO_U_F_FREE);
 		io_u->flags &= ~(IO_U_F_FREE | IO_U_F_FREE_DEF);
+		io_u->flags &= ~(IO_U_F_TRIMMED | IO_U_F_BARRIER);
 
 		io_u->error = 0;
 		flist_del(&io_u->list);
@@ -970,21 +1001,31 @@ again:
 	return io_u;
 }
 
-/*
- * Return an io_u to be processed. Gets a buflen and offset, sets direction,
- * etc. The returned io_u is fully ready to be prepped and submitted.
- */
-struct io_u *get_io_u(struct thread_data *td)
+static int check_get_trim(struct thread_data *td, struct io_u *io_u)
 {
-	struct fio_file *f;
-	struct io_u *io_u;
+	if (td->o.trim_backlog && td->trim_entries) {
+		int get_trim = 0;
 
-	io_u = __get_io_u(td);
-	if (!io_u) {
-		dprint(FD_IO, "__get_io_u failed\n");
-		return NULL;
+		if (td->trim_batch) {
+			td->trim_batch--;
+			get_trim = 1;
+		} else if (!(td->io_hist_len % td->o.trim_backlog) &&
+			 td->last_ddir != DDIR_READ) {
+			td->trim_batch = td->o.trim_batch;
+			if (!td->trim_batch)
+				td->trim_batch = td->o.trim_backlog;
+			get_trim = 1;
+		}
+
+		if (get_trim && !get_next_trim(td, io_u))
+			return 1;
 	}
 
+	return 0;
+}
+
+static int check_get_verify(struct thread_data *td, struct io_u *io_u)
+{
 	if (td->o.verify_backlog && td->io_hist_len) {
 		int get_verify = 0;
 
@@ -1000,8 +1041,31 @@ struct io_u *get_io_u(struct thread_data *td)
 		}
 
 		if (get_verify && !get_next_verify(td, io_u))
-			goto out;
+			return 1;
 	}
+
+	return 0;
+}
+
+/*
+ * Return an io_u to be processed. Gets a buflen and offset, sets direction,
+ * etc. The returned io_u is fully ready to be prepped and submitted.
+ */
+struct io_u *get_io_u(struct thread_data *td)
+{
+	struct fio_file *f;
+	struct io_u *io_u;
+
+	io_u = __get_io_u(td);
+	if (!io_u) {
+		dprint(FD_IO, "__get_io_u failed\n");
+		return NULL;
+	}
+
+	if (check_get_verify(td, io_u))
+		goto out;
+	if (check_get_trim(td, io_u))
+		goto out;
 
 	/*
 	 * from a requeue, io_u already setup
@@ -1023,7 +1087,7 @@ struct io_u *get_io_u(struct thread_data *td)
 	f = io_u->file;
 	assert(fio_file_open(f));
 
-	if (!ddir_sync(io_u->ddir)) {
+	if (ddir_rw(io_u->ddir)) {
 		if (!io_u->buflen && !(td->io_ops->flags & FIO_NOIO)) {
 			dprint(FD_IO, "get_io_u: zero buflen on %p\n", io_u);
 			goto err_put;
@@ -1052,6 +1116,7 @@ struct io_u *get_io_u(struct thread_data *td)
 	io_u->xfer_buflen = io_u->buflen;
 
 out:
+	assert(io_u->file);
 	if (!td_io_prep(td, io_u)) {
 		if (!td->o.disable_slat)
 			fio_gettime(&io_u->start_time, NULL);
@@ -1065,7 +1130,10 @@ err_put:
 
 void io_u_log_error(struct thread_data *td, struct io_u *io_u)
 {
-	const char *msg[] = { "read", "write", "sync" };
+	const char *msg[] = { "read", "write", "sync", "datasync",
+				"sync_file_range", "wait", "trim" };
+
+
 
 	log_err("fio: io_u error");
 
@@ -1111,7 +1179,7 @@ static void io_completed(struct thread_data *td, struct io_u *io_u,
 	td->last_was_sync = 0;
 	td->last_ddir = io_u->ddir;
 
-	if (!io_u->error) {
+	if (!io_u->error && ddir_rw(io_u->ddir)) {
 		unsigned int bytes = io_u->buflen - io_u->resid;
 		const enum fio_ddir idx = io_u->ddir;
 		const enum fio_ddir odx = io_u->ddir ^ 1;
@@ -1177,7 +1245,7 @@ static void io_completed(struct thread_data *td, struct io_u *io_u,
 			if (ret && !icd->error)
 				icd->error = ret;
 		}
-	} else {
+	} else if (io_u->error) {
 		icd->error = io_u->error;
 		io_u_log_error(td, io_u);
 	}
@@ -1306,6 +1374,8 @@ void io_u_queued(struct thread_data *td, struct io_u *io_u)
 void io_u_fill_buffer(struct thread_data *td, struct io_u *io_u,
 		      unsigned int max_bs)
 {
+	io_u->buf_filled_len = 0;
+
 	if (!td->o.zero_buffers)
 		fill_random_buf(io_u->buf, max_bs);
 	else

@@ -157,6 +157,8 @@ static void show_ddir_status(struct group_run_stats *rs, struct thread_stat *ts,
 	char *io_p, *bw_p, *iops_p;
 	int i2p;
 
+	assert(ddir_rw(ddir));
+
 	if (!ts->runtime[ddir])
 		return;
 
@@ -170,7 +172,7 @@ static void show_ddir_status(struct group_run_stats *rs, struct thread_stat *ts,
 	iops = (1000 * ts->total_io_u[ddir]) / runt;
 	iops_p = num2str(iops, 6, 1, 0);
 
-	log_info("  %s: io=%sB, bw=%sB/s, iops=%s, runt=%6lumsec\n",
+	log_info("  %s: io=%sB, bw=%sB/s, iops=%s, runt=%6llumsec\n",
 					ddir_str[ddir], io_p, bw_p, iops_p,
 					ts->runtime[ddir]);
 
@@ -349,9 +351,11 @@ static void show_thread_status(struct thread_stat *ts,
 					io_u_dist[1], io_u_dist[2],
 					io_u_dist[3], io_u_dist[4],
 					io_u_dist[5], io_u_dist[6]);
-	log_info("     issued r/w: total=%lu/%lu, short=%lu/%lu\n",
+	log_info("     issued r/w/d: total=%lu/%lu/%lu, short=%lu/%lu/%lu\n",
 					ts->total_io_u[0], ts->total_io_u[1],
-					ts->short_io_u[0], ts->short_io_u[1]);
+					ts->total_io_u[2],
+					ts->short_io_u[0], ts->short_io_u[1],
+					ts->short_io_u[2]);
 	stat_calc_lat_u(ts, io_u_lat_u);
 	stat_calc_lat_m(ts, io_u_lat_m);
 	show_latencies(io_u_lat_u, io_u_lat_m);
@@ -370,11 +374,13 @@ static void show_ddir_status_terse(struct thread_stat *ts,
 	unsigned long long bw;
 	double mean, dev;
 
+	assert(ddir_rw(ddir));
+
 	bw = 0;
 	if (ts->runtime[ddir])
 		bw = ts->io_bytes[ddir] / ts->runtime[ddir];
 
-	log_info(";%llu;%llu;%lu", ts->io_bytes[ddir] >> 10, bw,
+	log_info(";%llu;%llu;%llu", ts->io_bytes[ddir] >> 10, bw,
 							ts->runtime[ddir]);
 
 	if (calc_lat(&ts->slat_stat[ddir], &min, &max, &mean, &dev))
@@ -412,12 +418,15 @@ static void show_thread_status_terse(struct thread_stat *ts,
 	double usr_cpu, sys_cpu;
 	int i;
 
+	/* General Info */
 	log_info("%s;%s;%d;%d", FIO_TERSE_VERSION, ts->name, ts->groupid,
 				ts->error);
-
+	/* Log Read Status */
 	show_ddir_status_terse(ts, rs, 0);
+	/* Log Write Status */
 	show_ddir_status_terse(ts, rs, 1);
 
+	/* CPU Usage */
 	if (ts->total_run_time) {
 		double runt = (double) ts->total_run_time;
 
@@ -431,22 +440,28 @@ static void show_thread_status_terse(struct thread_stat *ts,
 	log_info(";%f%%;%f%%;%lu;%lu;%lu", usr_cpu, sys_cpu, ts->ctx, ts->majf,
 								ts->minf);
 
+	/* Calc % distribution of IO depths, usecond, msecond latency */
 	stat_calc_dist(ts->io_u_map, ts_total_io_u(ts), io_u_dist);
 	stat_calc_lat_u(ts, io_u_lat_u);
 	stat_calc_lat_m(ts, io_u_lat_m);
 
+	/* Only show fixed 7 I/O depth levels*/
 	log_info(";%3.1f%%;%3.1f%%;%3.1f%%;%3.1f%%;%3.1f%%;%3.1f%%;%3.1f%%",
 			io_u_dist[0], io_u_dist[1], io_u_dist[2], io_u_dist[3],
 			io_u_dist[4], io_u_dist[5], io_u_dist[6]);
 
+	/* Microsecond latency */
 	for (i = 0; i < FIO_IO_U_LAT_U_NR; i++)
 		log_info(";%3.2f%%", io_u_lat_u[i]);
+	/* Millisecond latency */
 	for (i = 0; i < FIO_IO_U_LAT_M_NR; i++)
 		log_info(";%3.2f%%", io_u_lat_m[i]);
+	/* Additional output if continue_on_error set - default off*/
 	if (ts->continue_on_error)
 		log_info(";%lu;%d", ts->total_err_count, ts->first_error);
 	log_info("\n");
 
+	/* Additional output if description is set */
 	if (ts->description)
 		log_info(";%s", ts->description);
 
@@ -611,7 +626,7 @@ void show_run_stats(void)
 			ts->io_u_lat_m[k] += td->ts.io_u_lat_m[k];
 
 
-		for (k = 0; k <= DDIR_WRITE; k++) {
+		for (k = 0; k <= 2; k++) {
 			ts->total_io_u[k] += td->ts.total_io_u[k];
 			ts->short_io_u[k] += td->ts.short_io_u[k];
 		}
@@ -713,7 +728,7 @@ static inline void add_stat_sample(struct io_stat *is, unsigned long data)
 
 static void __add_log_sample(struct io_log *iolog, unsigned long val,
 			     enum fio_ddir ddir, unsigned int bs,
-			     unsigned long time)
+			     unsigned long t)
 {
 	const int nr_samples = iolog->nr_samples;
 
@@ -725,7 +740,7 @@ static void __add_log_sample(struct io_log *iolog, unsigned long val,
 	}
 
 	iolog->log[nr_samples].val = val;
-	iolog->log[nr_samples].time = time;
+	iolog->log[nr_samples].time = t;
 	iolog->log[nr_samples].ddir = ddir;
 	iolog->log[nr_samples].bs = bs;
 	iolog->nr_samples++;
@@ -735,13 +750,20 @@ static void add_log_sample(struct thread_data *td, struct io_log *iolog,
 			   unsigned long val, enum fio_ddir ddir,
 			   unsigned int bs)
 {
+	if (!ddir_rw(ddir))
+		return;
+
 	__add_log_sample(iolog, val, ddir, bs, mtime_since_now(&td->epoch));
 }
 
 void add_agg_sample(unsigned long val, enum fio_ddir ddir, unsigned int bs)
 {
-	struct io_log *iolog = agg_io_log[ddir];
+	struct io_log *iolog;
 
+	if (!ddir_rw(ddir))
+		return;
+
+	iolog = agg_io_log[ddir];
 	__add_log_sample(iolog, val, ddir, bs, mtime_since_genesis());
 }
 
@@ -749,6 +771,9 @@ void add_clat_sample(struct thread_data *td, enum fio_ddir ddir,
 		     unsigned long usec, unsigned int bs)
 {
 	struct thread_stat *ts = &td->ts;
+
+	if (!ddir_rw(ddir))
+		return;
 
 	add_stat_sample(&ts->clat_stat[ddir], usec);
 
@@ -761,6 +786,9 @@ void add_slat_sample(struct thread_data *td, enum fio_ddir ddir,
 {
 	struct thread_stat *ts = &td->ts;
 
+	if (!ddir_rw(ddir))
+		return;
+
 	add_stat_sample(&ts->slat_stat[ddir], usec);
 
 	if (ts->slat_log)
@@ -772,6 +800,9 @@ void add_lat_sample(struct thread_data *td, enum fio_ddir ddir,
 {
 	struct thread_stat *ts = &td->ts;
 
+	if (!ddir_rw(ddir))
+		return;
+
 	add_stat_sample(&ts->lat_stat[ddir], usec);
 
 	if (ts->lat_log)
@@ -782,9 +813,12 @@ void add_bw_sample(struct thread_data *td, enum fio_ddir ddir, unsigned int bs,
 		   struct timeval *t)
 {
 	struct thread_stat *ts = &td->ts;
-	unsigned long spent = mtime_since(&ts->stat_sample_time[ddir], t);
-	unsigned long rate;
+	unsigned long spent, rate;
 
+	if (!ddir_rw(ddir))
+		return;
+
+	spent = mtime_since(&ts->stat_sample_time[ddir], t);
 	if (spent < td->o.bw_avg_time)
 		return;
 

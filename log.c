@@ -9,6 +9,7 @@
 #include "flist.h"
 #include "fio.h"
 #include "verify.h"
+#include "trim.h"
 
 static const char iolog_ver2[] = "fio version 2 iolog";
 
@@ -21,9 +22,9 @@ void queue_io_piece(struct thread_data *td, struct io_piece *ipo)
 void log_io_u(struct thread_data *td, struct io_u *io_u)
 {
 	const char *act[] = { "read", "write", "sync", "datasync",
-				"sync_file_range" };
+				"sync_file_range", "wait", "trim" };
 
-	assert(io_u->ddir <= 4);
+	assert(io_u->ddir <= 6);
 
 	if (!td->o.write_iolog_file)
 		return;
@@ -115,6 +116,7 @@ int read_iolog_get(struct thread_data *td, struct io_u *io_u)
 
 		ipo = flist_entry(td->io_log_list.next, struct io_piece, list);
 		flist_del(&ipo->list);
+		remove_trim_entry(td, ipo);
 
 		ret = ipo_special(td, ipo);
 		if (ret < 0) {
@@ -131,10 +133,10 @@ int read_iolog_get(struct thread_data *td, struct io_u *io_u)
 			io_u->buflen = ipo->len;
 			io_u->file = td->files[ipo->fileno];
 			get_file(io_u->file);
-
 			dprint(FD_IO, "iolog: get %llu/%lu/%s\n", io_u->offset,
 						io_u->buflen, io_u->file->file_name);
-			if (ipo->delay) iolog_delay(td, ipo->delay);
+			if (ipo->delay)
+				iolog_delay(td, ipo->delay);
 		} else {
 			elapsed = mtime_since_genesis();
 			if (ipo->delay > elapsed)
@@ -144,7 +146,7 @@ int read_iolog_get(struct thread_data *td, struct io_u *io_u)
 
 		free(ipo);
 		
-		if (ipo->ddir != DDIR_WAIT)
+		if (io_u->ddir != DDIR_WAIT)
 			return 0;
 	}
 
@@ -160,6 +162,7 @@ void prune_io_piece_log(struct thread_data *td)
 	while ((n = rb_first(&td->io_hist_tree)) != NULL) {
 		ipo = rb_entry(n, struct io_piece, rb_node);
 		rb_erase(n, &td->io_hist_tree);
+		remove_trim_entry(td, ipo);
 		td->io_hist_len--;
 		free(ipo);
 	}
@@ -167,6 +170,7 @@ void prune_io_piece_log(struct thread_data *td)
 	while (!flist_empty(&td->io_hist_list)) {
 		ipo = flist_entry(td->io_hist_list.next, struct io_piece, list);
 		flist_del(&ipo->list);
+		remove_trim_entry(td, ipo);
 		td->io_hist_len--;
 		free(ipo);
 	}
@@ -181,9 +185,15 @@ void log_io_piece(struct thread_data *td, struct io_u *io_u)
 	struct io_piece *ipo, *__ipo;
 
 	ipo = malloc(sizeof(struct io_piece));
+	init_ipo(ipo);
 	ipo->file = io_u->file;
 	ipo->offset = io_u->offset;
 	ipo->len = io_u->buflen;
+
+	if (io_u_should_trim(td, io_u)) {
+		flist_add_tail(&ipo->trim_list, &td->trim_list);
+		td->trim_entries++;
+	}
 
 	/*
 	 * We don't need to sort the entries, if:
@@ -203,6 +213,7 @@ void log_io_piece(struct thread_data *td, struct io_u *io_u)
 	      (file_randommap(td, ipo->file) || td->o.verify == VERIFY_NONE)) {
 		INIT_FLIST_HEAD(&ipo->list);
 		flist_add_tail(&ipo->list, &td->io_hist_list);
+		ipo->flags |= IP_F_ONLIST;
 		td->io_hist_len++;
 		return;
 	}
@@ -231,12 +242,15 @@ restart:
 			assert(ipo->len == __ipo->len);
 			td->io_hist_len--;
 			rb_erase(parent, &td->io_hist_tree);
+			remove_trim_entry(td, __ipo);
+			free(__ipo);
 			goto restart;
 		}
 	}
 
 	rb_link_node(&ipo->rb_node, parent, p);
 	rb_insert_color(&ipo->rb_node, &td->io_hist_tree);
+	ipo->flags |= IP_F_ONRB;
 	td->io_hist_len++;
 }
 
@@ -293,6 +307,8 @@ static int read_iolog2(struct thread_data *td, FILE *f)
 				rw = DDIR_SYNC;
 			else if (!strcmp(act, "datasync"))
 				rw = DDIR_DATASYNC;
+			else if (!strcmp(act, "trim"))
+				rw = DDIR_TRIM;
 			else {
 				log_err("fio: bad iolog file action: %s\n",
 									act);
@@ -342,8 +358,7 @@ static int read_iolog2(struct thread_data *td, FILE *f)
 		 * Make note of file
 		 */
 		ipo = malloc(sizeof(*ipo));
-		memset(ipo, 0, sizeof(*ipo));
-		INIT_FLIST_HEAD(&ipo->list);
+		init_ipo(ipo);
 		ipo->ddir = rw;
 		if (rw == DDIR_WAIT) {
 			ipo->delay = offset;
@@ -400,6 +415,7 @@ static int init_iolog_read(struct thread_data *td)
 	if (!p) {
 		td_verror(td, errno, "iolog read");
 		log_err("fio: unable to read iolog\n");
+		fclose(f);
 		return 1;
 	}
 
@@ -419,7 +435,7 @@ static int init_iolog_read(struct thread_data *td)
 }
 
 /*
- * Setup a log for storing io patterns.
+ * Set up a log for storing io patterns.
  */
 static int init_iolog_write(struct thread_data *td)
 {

@@ -24,10 +24,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <limits.h>
 #include <signal.h>
 #include <time.h>
 #include <locale.h>
 #include <assert.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/ipc.h>
@@ -38,6 +40,7 @@
 #include "hash.h"
 #include "smalloc.h"
 #include "verify.h"
+#include "trim.h"
 #include "diskutil.h"
 #include "cgroup.h"
 #include "profile.h"
@@ -61,8 +64,8 @@ static struct fio_mutex *startup_mutex;
 static struct fio_mutex *writeout_mutex;
 static volatile int fio_abort;
 static int exit_value;
-static struct itimerval itimer;
 static pthread_t gtod_thread;
+static pthread_t disk_util_thread;
 static struct flist_head *cgroup_list;
 static char *cgroup_mnt;
 
@@ -99,30 +102,14 @@ static void terminate_threads(int group_id)
 			 * if the thread is running, just let it exit
 			 */
 			if (td->runstate < TD_RUNNING)
-				kill(td->pid, SIGQUIT);
+				kill(td->pid, SIGTERM);
 			else {
 				struct ioengine_ops *ops = td->io_ops;
 
-				if (ops && (ops->flags & FIO_SIGQUIT))
-					kill(td->pid, SIGQUIT);
+				if (ops && (ops->flags & FIO_SIGTERM))
+					kill(td->pid, SIGTERM);
 			}
 		}
-	}
-}
-
-static void status_timer_arm(void)
-{
-	itimer.it_value.tv_sec = 0;
-	itimer.it_value.tv_usec = DISK_UTIL_MSEC * 1000;
-	setitimer(ITIMER_REAL, &itimer, NULL);
-}
-
-static void sig_alrm(int fio_unused sig)
-{
-	if (threads) {
-		update_io_ticks();
-		print_thread_status();
-		status_timer_arm();
 	}
 }
 
@@ -142,14 +129,46 @@ static void sig_int(int sig)
 	}
 }
 
+static void *disk_thread_main(void *data)
+{
+	fio_mutex_up(startup_mutex);
+
+	while (threads) {
+		usleep(DISK_UTIL_MSEC * 1000);
+		if (!threads)
+			break;
+		update_io_ticks();
+		print_thread_status();
+	}
+
+	return NULL;
+}
+
+static int create_disk_util_thread(void)
+{
+	int ret;
+
+	ret = pthread_create(&disk_util_thread, NULL, disk_thread_main, NULL);
+	if (ret) {
+		log_err("Can't create disk util thread: %s\n", strerror(ret));
+		return 1;
+	}
+
+	ret = pthread_detach(disk_util_thread);
+	if (ret) {
+		log_err("Can't detatch disk util thread: %s\n", strerror(ret));
+		return 1;
+	}
+
+	dprint(FD_MUTEX, "wait on startup_mutex\n");
+	fio_mutex_down(startup_mutex);
+	dprint(FD_MUTEX, "done waiting on startup_mutex\n");
+	return 0;
+}
+
 static void set_sig_handlers(void)
 {
 	struct sigaction act;
-
-	memset(&act, 0, sizeof(act));
-	act.sa_handler = sig_alrm;
-	act.sa_flags = SA_RESTART;
-	sigaction(SIGALRM, &act, NULL);
 
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = sig_int;
@@ -159,7 +178,7 @@ static void set_sig_handlers(void)
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = sig_quit;
 	act.sa_flags = SA_RESTART;
-	sigaction(SIGQUIT, &act, NULL);
+	sigaction(SIGTERM, &act, NULL);
 }
 
 /*
@@ -175,6 +194,8 @@ static int __check_min_rate(struct thread_data *td, struct timeval *now,
 	unsigned int ratemin = 0;
 	unsigned int rate_iops = 0;
 	unsigned int rate_iops_min = 0;
+
+	assert(ddir_rw(ddir));
 
 	if (!td->o.ratemin[ddir] && !td->o.rate_iops_min[ddir])
 		return 0;
@@ -476,7 +497,6 @@ static void do_verify(struct thread_data *td)
 				clear_io_u(td, io_u);
 			} else if (io_u->resid) {
 				int bytes = io_u->xfer_buflen - io_u->resid;
-				struct fio_file *f = io_u->file;
 
 				/*
 				 * zero read, fail
@@ -491,8 +511,10 @@ static void do_verify(struct thread_data *td)
 				io_u->xfer_buf += bytes;
 				io_u->offset += bytes;
 
-				td->ts.short_io_u[io_u->ddir]++;
+				if (ddir_rw(io_u->ddir))
+					td->ts.short_io_u[io_u->ddir]++;
 
+				f = io_u->file;
 				if (io_u->offset == f->real_file_size)
 					goto sync_done;
 
@@ -576,6 +598,7 @@ static void do_io(struct thread_data *td)
 		td_set_runstate(td, TD_RUNNING);
 
 	while ( (td->o.read_iolog_file && !flist_empty(&td->io_log_list)) ||
+		(!flist_empty(&td->trim_list)) ||
 	        ((td->this_io_bytes[0] + td->this_io_bytes[1]) < td->o.size) ) {
 		struct timeval comp_time;
 		unsigned long bytes_done[2] = { 0, 0 };
@@ -636,7 +659,8 @@ static void do_io(struct thread_data *td)
 				io_u->xfer_buf += bytes;
 				io_u->offset += bytes;
 
-				td->ts.short_io_u[io_u->ddir]++;
+				if (ddir_rw(io_u->ddir))
+					td->ts.short_io_u[io_u->ddir]++;
 
 				if (io_u->offset == f->real_file_size)
 					goto sync_done;
@@ -730,6 +754,9 @@ sync_done:
 		}
 	}
 
+	if (td->trim_entries)
+		printf("trim entries %ld\n", td->trim_entries);
+
 	if (td->o.fill_device && td->error == ENOSPC) {
 		td->error = 0;
 		td->terminate = 1;
@@ -802,7 +829,8 @@ static int init_io_u(struct thread_data *td)
 	if (allocate_io_mem(td))
 		return 1;
 
-	if (td->o.odirect || td->o.mem_align)
+	if (td->o.odirect || td->o.mem_align ||
+	    (td->io_ops->flags & FIO_RAWIO))
 		p = PAGE_ALIGN(td->orig_buffer) + td->o.mem_align;
 	else
 		p = td->orig_buffer;
@@ -836,7 +864,7 @@ static int init_io_u(struct thread_data *td)
 				 * Fill the buffer with the pattern if we are
 				 * going to be doing writes.
 				 */
-				fill_pattern(td, io_u->buf, max_bs, io_u);
+				fill_pattern(td, io_u->buf, max_bs, io_u, 0, 0);
 			}
 		}
 
@@ -960,8 +988,10 @@ void reset_all_stats(struct thread_data *td)
 		td->io_issues[i] = 0;
 		td->ts.total_io_u[i] = 0;
 	}
-	
+
 	fio_gettime(&tv, NULL);
+	td->ts.runtime[0] = 0;
+	td->ts.runtime[1] = 0;
 	memcpy(&td->epoch, &tv, sizeof(tv));
 	memcpy(&td->start, &tv, sizeof(tv));
 }
@@ -1000,7 +1030,7 @@ static int exec_string(const char *string)
  */
 static void *thread_main(void *data)
 {
-	unsigned long long runtime[2], elapsed;
+	unsigned long long elapsed;
 	struct thread_data *td = data;
 	pthread_condattr_t attr;
 	int clear_state;
@@ -1018,6 +1048,7 @@ static void *thread_main(void *data)
 	INIT_FLIST_HEAD(&td->io_log_list);
 	INIT_FLIST_HEAD(&td->io_hist_list);
 	INIT_FLIST_HEAD(&td->verify_list);
+	INIT_FLIST_HEAD(&td->trim_list);
 	pthread_mutex_init(&td->io_u_lock, NULL);
 	td->io_hist_tree = RB_ROOT;
 
@@ -1038,12 +1069,16 @@ static void *thread_main(void *data)
 	 */
 	fio_mutex_remove(td->mutex);
 
-	if (td->o.uid != -1U && setuid(td->o.uid)) {
-		td_verror(td, errno, "setuid");
-		goto err;
-	}
+	/*
+	 * A new gid requires privilege, so we need to do this before setting
+	 * the uid.
+	 */
 	if (td->o.gid != -1U && setgid(td->o.gid)) {
 		td_verror(td, errno, "setgid");
+		goto err;
+	}
+	if (td->o.uid != -1U && setuid(td->o.uid)) {
+		td_verror(td, errno, "setuid");
 		goto err;
 	}
 
@@ -1117,7 +1152,6 @@ static void *thread_main(void *data)
 	fio_gettime(&td->epoch, NULL);
 	getrusage(RUSAGE_SELF, &td->ts.ru_start);
 
-	runtime[0] = runtime[1] = 0;
 	clear_state = 0;
 	while (keep_running(td)) {
 		fio_gettime(&td->start, NULL);
@@ -1142,11 +1176,11 @@ static void *thread_main(void *data)
 
 		if (td_read(td) && td->io_bytes[DDIR_READ]) {
 			elapsed = utime_since_now(&td->start);
-			runtime[DDIR_READ] += elapsed;
+			td->ts.runtime[DDIR_READ] += elapsed;
 		}
 		if (td_write(td) && td->io_bytes[DDIR_WRITE]) {
 			elapsed = utime_since_now(&td->start);
-			runtime[DDIR_WRITE] += elapsed;
+			td->ts.runtime[DDIR_WRITE] += elapsed;
 		}
 
 		if (td->error || td->terminate)
@@ -1163,15 +1197,15 @@ static void *thread_main(void *data)
 
 		do_verify(td);
 
-		runtime[DDIR_READ] += utime_since_now(&td->start);
+		td->ts.runtime[DDIR_READ] += utime_since_now(&td->start);
 
 		if (td->error || td->terminate)
 			break;
 	}
 
 	update_rusage_stat(td);
-	td->ts.runtime[0] = (runtime[0] + 999) / 1000;
-	td->ts.runtime[1] = (runtime[1] + 999) / 1000;
+	td->ts.runtime[0] = (td->ts.runtime[0] + 999) / 1000;
+	td->ts.runtime[1] = (td->ts.runtime[1] + 999) / 1000;
 	td->ts.total_run_time = mtime_since_now(&td->epoch);
 	td->ts.io_bytes[0] = td->io_bytes[0];
 	td->ts.io_bytes[1] = td->io_bytes[1];
@@ -1323,7 +1357,7 @@ static void reap_threads(int *nr_running, int *t_rate, int *m_rate)
 			if (WIFSIGNALED(status)) {
 				int sig = WTERMSIG(status);
 
-				if (sig != SIGQUIT)
+				if (sig != SIGTERM)
 					log_err("fio: pid=%d, got signal=%d\n",
 							(int) td->pid, sig);
 				td_set_runstate(td, TD_REAPED);
@@ -1380,9 +1414,13 @@ static void *gtod_thread_main(void *data)
 
 static int fio_start_gtod_thread(void)
 {
+	pthread_attr_t attr;
 	int ret;
 
-	ret = pthread_create(&gtod_thread, NULL, gtod_thread_main, NULL);
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN);
+	ret = pthread_create(&gtod_thread, &attr, gtod_thread_main, NULL);
+	pthread_attr_destroy(&attr);
 	if (ret) {
 		log_err("Can't create gtod thread: %s\n", strerror(ret));
 		return 1;
@@ -1459,14 +1497,14 @@ static void run_threads(void)
 			todo--;
 		} else {
 			struct fio_file *f;
-			unsigned int i;
+			unsigned int j;
 
 			/*
 			 * for sharing to work, each job must always open
 			 * its own files. so close them, if we opened them
 			 * for creation
 			 */
-			for_each_file(td, f, i) {
+			for_each_file(td, f, j) {
 				if (fio_file_open(f))
 					td_io_close_file(td, f);
 			}
@@ -1670,11 +1708,14 @@ int main(int argc, char *argv[])
 	}
 
 	startup_mutex = fio_mutex_init(0);
+	if (startup_mutex == NULL)
+		return 1;
 	writeout_mutex = fio_mutex_init(1);
+	if (writeout_mutex == NULL)
+		return 1;
 
 	set_genesis_time();
-
-	status_timer_arm();
+	create_disk_util_thread();
 
 	cgroup_list = smalloc(sizeof(*cgroup_list));
 	INIT_FLIST_HEAD(cgroup_list);

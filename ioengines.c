@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <assert.h>
 
 #include "fio.h"
@@ -241,7 +242,7 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 					sizeof(struct timeval));
 	}
 
-	if (!ddir_sync(io_u->ddir))
+	if (ddir_rw(io_u->ddir))
 		td->io_issues[io_u->ddir]++;
 
 	ret = td->io_ops->queue(td, io_u);
@@ -254,7 +255,7 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 	 * IO, then it's likely an alignment problem or because the host fs
 	 * does not support O_DIRECT
 	 */
-	if (io_u->error == EINVAL && td->io_issues[io_u->ddir] == 1 &&
+	if (io_u->error == EINVAL && td->io_issues[io_u->ddir & 1] == 1 &&
 	    td->o.odirect) {
 		log_info("fio: first direct IO errored. File system may not "
 			 "support direct IO, or iomem_align= is bad.\n");
@@ -266,14 +267,15 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (ret == FIO_Q_COMPLETED) {
-		if (!ddir_sync(io_u->ddir)) {
+		if (ddir_rw(io_u->ddir)) {
 			io_u_mark_depth(td, 1);
 			td->ts.total_io_u[io_u->ddir]++;
-		}
+		} else if (io_u->ddir == DDIR_TRIM)
+			td->ts.total_io_u[2]++;
 	} else if (ret == FIO_Q_QUEUED) {
 		int r;
 
-		if (!ddir_sync(io_u->ddir)) {
+		if (ddir_rw(io_u->ddir)) {
 			td->io_u_queued++;
 			td->ts.total_io_u[io_u->ddir]++;
 		}
@@ -385,7 +387,7 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
 		else
 			flags = POSIX_FADV_SEQUENTIAL;
 
-		if (fadvise(f->fd, f->file_offset, f->io_size, flags) < 0) {
+		if (posix_fadvise(f->fd, f->file_offset, f->io_size, flags) < 0) {
 			td_verror(td, errno, "fadvise");
 			goto err;
 		}
@@ -401,6 +403,7 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
 
 		if (ret) {
 			td_verror(td, ret, "fio_set_odirect");
+			log_err("fio: the file system does not seem to support direct IO\n");
 			goto err;
 		}
 	}
@@ -483,16 +486,16 @@ int do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 {
 #ifndef FIO_HAVE_TRIM
 	io_u->error = EINVAL;
-	return io_u->xfer_buflen;
+	return 0;
 #else
 	struct fio_file *f = io_u->file;
 	int ret;
 
-	ret = os_trim(f->fd, io_u->offset + f->file_offset, io_u->xfer_buflen);
+	ret = os_trim(f->fd, io_u->offset, io_u->xfer_buflen);
 	if (!ret)
-		return 0;
+		return io_u->xfer_buflen;;
 
-	io_u->error = errno;
-	return io_u->xfer_buflen;
+	io_u->error = ret;
+	return 0;
 #endif
 }

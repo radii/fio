@@ -23,17 +23,40 @@ well. You can download them here:
 
 http://brick.kernel.dk/snaps/
 
-Pascal Bleser <guru@unixtech.be> has fio RPMs in his repository for
-SUSE variants, you can find them here:
 
+Binary packages
+---------------
+
+Debian:
+Starting with Debian "Squeeze", fio packages are part of the official
+Debian repository. http://packages.debian.org/search?keywords=fio
+
+Ubuntu:
+Starting with Ubuntu 10.04 LTS (aka "Lucid Lynx"), fio packages are part
+of the Ubuntu "universe" repository.
+http://packages.ubuntu.com/search?keywords=fio
+
+SUSE:
+Pascal Bleser <guru@unixtech.be> has fio RPMs in his repository for SUSE
+variants, you can find them here:
 http://linux01.gwdg.de/~pbleser/rpm-navigation.php?cat=System/fio
 
+Red Hat, CentOS & Co:
 Dag Wieërs has RPMs for Red Hat related distros, find them here:
-
 http://dag.wieers.com/rpm/packages/fio/
 
+Mandriva:
 Mandriva has integrated fio into their package repository, so installing
 on that distro should be as easy as typing 'urpmi fio'.
+
+Solaris:
+Packages for Solaris are available from OpenCSW. Install their pkgutil
+tool (http://www.opencsw.org/get-it/pkgutil/) and then install fio via
+'pkgutil -i fio'.
+
+Windows:
+Bruce Cran <bruce@cran.org.uk> has fio packages for Windows at
+http://www.bluestop.org/fio .
 
 
 Mailing list
@@ -60,10 +83,14 @@ http://maillist.kernel.dk/fio-devel/
 Building
 --------
 
-Just type 'make' and 'make install'. If on FreeBSD, for now you have to
-specify the FreeBSD Makefile with -f and use gmake (not make), eg:
+Just type 'make' and 'make install'. If on BSD, for now you have to
+specify the BSD Makefile with -f and use gmake (not make), eg:
 
-$ gmake -f Makefile.Freebsd && gmake -f Makefile.FreeBSD install
+$ gmake -f Makefile.FreeBSD && gmake -f Makefile.FreeBSD install
+
+Same goes for AIX:
+
+$ gmake -f Makefile.aix && gmake -f Makefile.aix install
 
 Likewise with OpenSolaris, use the Makefile.solaris to compile there.
 The OpenSolaris make should work fine. This might change in the
@@ -83,25 +110,46 @@ Check that you have the libaio development package installed. On RPM
 based distros, it's typically called libaio-devel.
 
 
+Windows
+-------
+
+On Windows Cygwin (http://www.cygwin.com) is required with at least
+devel/gcc4 and devel/make installed in order to build fio, and
+admin/cygrunsrv to run it. You can also install devel/git to fetch/update
+the source files. To create an MSI installer package, install WiX 3.6 from
+http://wix.sourceforge.net/releases/ and run dobuild.cmd from the
+os/windows directory.
+
+Before running fio you'll need to have a copy of cygserver running. Run 
+"/usr/bin/cygserver-config" from an elevated Cygwin shell (i.e. launch the
+Cygwin shell under the Administrator account) to configure it. Once
+configured, run "net start cygserver" to start it, or type
+"/usr/sbin/cygserver &" in the Cygwin shell to start a local copy. 
+
+If fio exits with the message "Bad system call" it normally means that
+Cygserver isn't running.
+
+
 Command line
 ------------
 
 $ fio
-        --debug         Enable some debugging options (see below)
-        --output        Write output to file
-        --timeout       Runtime in seconds
-        --latency-log   Generate per-job latency logs
-        --bandwidth-log Generate per-job bandwidth logs
-        --minimal       Minimal (terse) output
-        --version       Print version info and exit
-	--help		Print this page
+	--debug			Enable some debugging options (see below)
+	--output		Write output to file
+	--timeout		Runtime in seconds
+	--latency-log	Generate per-job latency logs
+	--bandwidth-log	Generate per-job bandwidth logs
+	--minimal		Minimal (terse) output
+	--version		Print version info and exit
+	--help			Print this page
 	--cmdhelp=cmd	Print command help, "all" for all of them
-	--showcmd	Turn a job file into command line options
-	--readonly	Turn on safety read-only checks, preventing writes
-	--eta=when	When ETA estimate should be printed
-			May be "always", "never" or "auto"
+	--showcmd		Turn a job file into command line options
+	--readonly		Turn on safety read-only checks, preventing writes
+	--eta=when		When ETA estimate should be printed
+					May be "always", "never" or "auto"
 	--section=name	Only run specified section in job file
 	--alloc-size=kb	Set smalloc pool to this size in kb (def 1024)
+	--warnings-fatal Fio parser warnings are fatal
 
 
 Any parameters following the options will be assumed to be job files,
@@ -109,7 +157,7 @@ unless they match a job file parameter. You can add as many as you want,
 each job file will be regarded as a separate group and fio will stonewall
 its execution.
 
-The --readonly switch is an extra safety guard to prevent accidentically
+The --readonly switch is an extra safety guard to prevent accidentally
 turning on a write setting when that is not desired. Fio will only write
 if rw=write/randwrite/rw/randrw is given, but this extra safety net can
 be used as an extra precaution. It will also enable a write check in the
@@ -120,11 +168,11 @@ options in fio. Currently the options are:
 
 	process		Dump info related to processes
 	file		Dump info related to file actions
-	io		Dump info related to IO queuing
-	mem		Dump info related to memory allocations
+	io			Dump info related to IO queuing
+	mem			Dump info related to memory allocations
 	blktrace	Dump info related to blktrace setup
 	verify		Dump info related to IO verification
-	all		Enable all debug options
+	all			Enable all debug options
 	random		Dump info related to random offset generation
 	parse		Dump info related to option matching and parsing
 	diskutil	Dump info related to disk utilization updates
@@ -185,7 +233,8 @@ The job file parameters are:
 	size=x		Set file size to x bytes (x string can include k/m/g)
 	ioengine=x	'x' may be: aio/libaio/linuxaio for Linux aio,
 			posixaio for POSIX aio, solarisaio for Solaris
-			native async IO, sync for regular read/write io,
+			native async IO, windowsaio for Windows native async IO,
+			sync for regular read/write io,
 			psync for regular pread/pwrite io, vsync for regular
 			readv/writev (with queuing emulation) mmap for mmap'ed
 			io, syslet-rw for syslet driven read/write, splice for
@@ -251,7 +300,9 @@ The job file parameters are:
 			and length entries being in bytes.
 	write_iolog=x	Write an iolog to file 'x' in the same format as iolog.
 			The iolog options are exclusive, if both given the
-			read iolog will be performed.
+			read iolog will be performed.  Specify a separate file
+			for each job, otherwise the iologs will be interspersed
+			and the file may be corrupt.
 	write_bw_log	Write a bandwidth log.
 	write_lat_log	Write a latency log.
 	lockmem=x	Lock down x amount of memory on the machine, to
@@ -270,10 +321,10 @@ The job file parameters are:
 Platforms
 ---------
 
-Fio works on (at least) Linux, Solaris, and FreeBSD. Some features and/or
-options may only be available on some of the platforms, typically because
-those features only apply to that platform (like the solarisaio engine, or
-the splice engine on Linux).
+Fio works on (at least) Linux, Solaris, AIX, OSX, NetBSD, Windows and FreeBSD.
+Some features and/or options may only be available on some of the platforms,
+typically because those features only apply to that platform (like the
+solarisaio engine, or the splice engine on Linux).
 
 Some features are not available on FreeBSD/Solaris even if they could be
 implemented, I'd be happy to take patches for that. An example of that is
@@ -291,6 +342,23 @@ your mileage may vary. Sending me patches for other platforms is greatly
 appreciated. There's a lot of value in having the same test/benchmark tool
 available on all platforms.
 
+Note that POSIX aio is not enabled by default on AIX. If you get messages like:
+
+    Symbol resolution failed for /usr/lib/libc.a(posix_aio.o) because:
+        Symbol _posix_kaio_rdwr (number 2) is not exported from dependent module /unix.
+
+you need to enable POSIX aio. Run the following commands as root:
+
+    # lsdev -C -l posix_aio0
+        posix_aio0 Defined  Posix Asynchronous I/O
+    # cfgmgr -l posix_aio0
+    # lsdev -C -l posix_aio0
+        posix_aio0 Available  Posix Asynchronous I/O
+
+POSIX aio should work now. To make the change permanent:
+
+    # chdev -l posix_aio0 -P -a autoconfig='available'
+        posix_aio0 changed
 
 
 Author

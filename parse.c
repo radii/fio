@@ -79,6 +79,7 @@ static void show_option_help(struct fio_option *o, FILE *out)
 	const char *typehelp[] = {
 		"invalid",
 		"string (opt=bla)",
+		"string (opt=bla)",
 		"string with possible k/m/g postfix (opt=4k)",
 		"string with time postfix (opt=10s)",
 		"string (opt=bla)",
@@ -168,6 +169,9 @@ static unsigned long long __get_mult_bytes(const char *p, void *data)
 static unsigned long long get_mult_bytes(const char *str, int len, void *data)
 {
 	const char *p;
+
+	if (len < 2)
+		return __get_mult_bytes(str, data);
 
 	/*
 	 * if the last char is 'b' or 'B', the user likely used
