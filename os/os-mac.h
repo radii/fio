@@ -1,27 +1,37 @@
 #ifndef FIO_OS_APPLE_H
 #define FIO_OS_APPLE_H
 
+#define	FIO_OS	os_mac
+
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/disk.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <signal.h>
+#include <mach/mach_init.h>
+#include <machine/endian.h>
+#include <libkern/OSByteOrder.h>
 
 #include "../file.h"
 
-#ifndef CLOCK_MONOTONIC
-#define CLOCK_MONOTONIC 1
-#endif
-
-#ifndef CLOCK_REALTIME
-#define CLOCK_REALTIME 1
-#endif
-
-#define FIO_HAVE_POSIXAIO
-#define FIO_HAVE_CLOCK_MONOTONIC
-#define FIO_USE_GENERIC_BDEV_SIZE
+#define FIO_USE_GENERIC_RAND
+#define FIO_USE_GENERIC_INIT_RANDOM_STATE
+#define FIO_HAVE_GETTID
+#define FIO_HAVE_CHARDEV_SIZE
 
 #define OS_MAP_ANON		MAP_ANON
+
+#define fio_swap16(x)	OSSwapInt16(x)
+#define fio_swap32(x)	OSSwapInt32(x)
+#define fio_swap64(x)	OSSwapInt64(x)
+
+/*
+ * OSX has a pitifully small shared memory segment by default,
+ * so default to a lower number of max jobs supported
+ */
+#define FIO_MAX_JOBS		128
 
 typedef off_t off64_t;
 
@@ -42,17 +52,6 @@ struct itimerspec {
 static struct sigevent fio_timers[MAX_TIMERS];
 static unsigned int num_timers = 0;
 
-static inline int timer_create(clockid_t clockid, struct sigevent *restrict evp,
-				 timer_t *restrict timerid)
-{
-	int current_timer = num_timers;
-	fio_timers[current_timer] = *evp;
-	num_timers++;
-	
-	*timerid = current_timer;
-	return 0;
-}
-
 static void sig_alrm(int signum)
 {
 	union sigval sv;
@@ -69,7 +68,8 @@ static void sig_alrm(int signum)
 }
 
 static inline int timer_settime(timer_t timerid, int flags,
-								const struct itimerspec *value, struct itimerspec *ovalue)
+				const struct itimerspec *value,
+				struct itimerspec *ovalue)
 {
 	struct sigaction sa;
 	struct itimerval tv;
@@ -106,6 +106,42 @@ static inline int timer_delete(timer_t timer)
 	return 0;
 }
 
+#define FIO_OS_DIRECTIO
+static inline int fio_set_odirect(int fd)
+{
+	if (fcntl(fd, F_NOCACHE, 1) == -1)
+		return errno;
+	return 0;
+}
+
+static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
+{
+	uint32_t block_size;
+	uint64_t block_count;
+
+	if (ioctl(f->fd, DKIOCGETBLOCKCOUNT, &block_count) == -1)
+		return errno;
+	if (ioctl(f->fd, DKIOCGETBLOCKSIZE, &block_size) == -1)
+		return errno;
+
+	*bytes = block_size;
+	*bytes *= block_count;
+	return 0;
+}
+
+static inline int chardev_size(struct fio_file *f, unsigned long long *bytes)
+{
+	/*
+	 * Could be a raw block device, this is better than just assuming
+	 * we can't get the size at all.
+	 */
+	if (!blockdev_size(f, bytes))
+		return 0;
+
+	*bytes = -1ULL;
+	return 0;
+}
+
 static inline int blockdev_invalidate_cache(struct fio_file *f)
 {
 	return EINVAL;
@@ -121,17 +157,15 @@ static inline unsigned long long os_phys_mem(void)
 	return mem;
 }
 
-static inline void os_random_seed(unsigned long seed, os_random_state_t *rs)
+static inline int gettid(void)
 {
-	srand48_r(seed, rs);
+	return mach_thread_self();
 }
 
-static inline long os_random_long(os_random_state_t *rs)
-{
-	long val;
-
-	lrand48_r(rs, &val);
-	return val;
-}
+/*
+ * For some reason, there's no header definition for fdatasync(), even
+ * if it exists.
+ */
+extern int fdatasync(int fd);
 
 #endif

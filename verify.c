@@ -10,9 +10,9 @@
 
 #include "fio.h"
 #include "verify.h"
-#include "smalloc.h"
 #include "trim.h"
 #include "lib/rand.h"
+#include "lib/hweight.h"
 
 #include "crc/md5.h"
 #include "crc/crc64.h"
@@ -36,41 +36,27 @@ void fill_pattern(struct thread_data *td, void *p, unsigned int len, struct io_u
 		if (use_seed)
 			__fill_random_buf(p, len, seed);
 		else
-			io_u->rand_seed = fill_random_buf(p, len);
+			io_u->rand_seed = fill_random_buf(&td->buf_state, p, len);
 		break;
 	case 1:
-		/*
-		 * See below write barrier comment
-		 */
-#if 0
-		read_barrier();
 		if (io_u->buf_filled_len >= len) {
 			dprint(FD_VERIFY, "using already filled verify pattern b=0 len=%u\n", len);
 			return;
 		}
-#endif
 		dprint(FD_VERIFY, "fill verify pattern b=0 len=%u\n", len);
 		memset(p, td->o.verify_pattern[0], len);
-		/*
-		 * We need to ensure that the pattern stores are seen before
-		 * the fill length store, or we could observe headers that
-		 * aren't valid to the extent notified by the fill length
-		 */
-		write_barrier();
 		io_u->buf_filled_len = len;
 		break;
 	default: {
 		unsigned int i = 0, size = 0;
 		unsigned char *b = p;
 
-#if 0
-		read_barrier();
 		if (io_u->buf_filled_len >= len) {
 			dprint(FD_VERIFY, "using already filled verify pattern b=%d len=%u\n",
 					td->o.verify_pattern_bytes, len);
 			return;
 		}
-#endif
+
 		dprint(FD_VERIFY, "fill verify pattern b=%d len=%u\n",
 					td->o.verify_pattern_bytes, len);
 
@@ -81,7 +67,6 @@ void fill_pattern(struct thread_data *td, void *p, unsigned int len, struct io_u
 			memcpy(b+i, td->o.verify_pattern, size);
 			i += size;
 		}
-		write_barrier();
 		io_u->buf_filled_len = len;
 		break;
 		}
@@ -93,7 +78,7 @@ static unsigned int get_hdr_inc(struct thread_data *td, struct io_u *io_u)
 	unsigned int hdr_inc;
 
 	hdr_inc = io_u->buflen;
-	if (td->o.verify_interval)
+	if (td->o.verify_interval && td->o.verify_interval <= io_u->buflen)
 		hdr_inc = td->o.verify_interval;
 
 	return hdr_inc;
@@ -269,6 +254,9 @@ static void dump_verify_buffers(struct verify_header *hdr, struct vcont *vc)
 	struct io_u dummy;
 	void *buf;
 
+	if (!td->o.verify_dump)
+		return;
+
 	/*
 	 * Dump the contents we just read off disk
 	 */
@@ -320,28 +308,33 @@ static inline void *io_u_verify_off(struct verify_header *hdr, struct vcont *vc)
 	return vc->io_u->buf + vc->hdr_num * hdr->len + hdr_size(hdr);
 }
 
-static unsigned int hweight8(unsigned int w)
-{
-	unsigned int res = w - ((w >> 1) & 0x55);
-
-	res = (res & 0x33) + ((res >> 2) & 0x33);
-	return (res + (res >> 4)) & 0x0F;
-}
-
 static int verify_io_u_pattern(struct verify_header *hdr, struct vcont *vc)
 {
 	struct thread_data *td = vc->td;
 	struct io_u *io_u = vc->io_u;
 	char *buf, *pattern;
 	unsigned int header_size = __hdr_size(td->o.verify);
-	unsigned int len, mod, i;
+	unsigned int len, mod, i, size, pattern_size;
 
 	pattern = td->o.verify_pattern;
+	pattern_size = td->o.verify_pattern_bytes;
+	if (pattern_size <= 1)
+		pattern_size = MAX_PATTERN_SIZE;
 	buf = (void *) hdr + header_size;
 	len = get_hdr_inc(td, io_u) - header_size;
-	mod = header_size % td->o.verify_pattern_bytes;
+	mod = header_size % pattern_size;
 
-	for (i = 0; i < len; i++) {
+	for (i = 0; i < len; i += size) {
+		size = pattern_size - mod;
+		if (size > (len - i))
+			size = len - i;
+		if (memcmp(buf + i, pattern + mod, size))
+			/* Let the slow compare find the first mismatch byte. */
+			break;
+		mod = 0;
+	}
+
+	for (; i < len; i++) {
 		if (buf[i] != pattern[mod]) {
 			unsigned int bits;
 
@@ -388,14 +381,14 @@ static int verify_io_u_sha512(struct verify_header *hdr, struct vcont *vc)
 	void *p = io_u_verify_off(hdr, vc);
 	struct vhdr_sha512 *vh = hdr_priv(hdr);
 	uint8_t sha512[128];
-	struct sha512_ctx sha512_ctx = {
+	struct fio_sha512_ctx sha512_ctx = {
 		.buf = sha512,
 	};
 
 	dprint(FD_VERIFY, "sha512 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	sha512_init(&sha512_ctx);
-	sha512_update(&sha512_ctx, p, hdr->len - hdr_size(hdr));
+	fio_sha512_init(&sha512_ctx);
+	fio_sha512_update(&sha512_ctx, p, hdr->len - hdr_size(hdr));
 
 	if (!memcmp(vh->sha512, sha512_ctx.buf, sizeof(sha512)))
 		return 0;
@@ -413,14 +406,14 @@ static int verify_io_u_sha256(struct verify_header *hdr, struct vcont *vc)
 	void *p = io_u_verify_off(hdr, vc);
 	struct vhdr_sha256 *vh = hdr_priv(hdr);
 	uint8_t sha256[64];
-	struct sha256_ctx sha256_ctx = {
+	struct fio_sha256_ctx sha256_ctx = {
 		.buf = sha256,
 	};
 
 	dprint(FD_VERIFY, "sha256 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	sha256_init(&sha256_ctx);
-	sha256_update(&sha256_ctx, p, hdr->len - hdr_size(hdr));
+	fio_sha256_init(&sha256_ctx);
+	fio_sha256_update(&sha256_ctx, p, hdr->len - hdr_size(hdr));
 
 	if (!memcmp(vh->sha256, sha256_ctx.buf, sizeof(sha256)))
 		return 0;
@@ -438,14 +431,14 @@ static int verify_io_u_sha1(struct verify_header *hdr, struct vcont *vc)
 	void *p = io_u_verify_off(hdr, vc);
 	struct vhdr_sha1 *vh = hdr_priv(hdr);
 	uint32_t sha1[5];
-	struct sha1_ctx sha1_ctx = {
+	struct fio_sha1_ctx sha1_ctx = {
 		.H = sha1,
 	};
 
 	dprint(FD_VERIFY, "sha1 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	sha1_init(&sha1_ctx);
-	sha1_update(&sha1_ctx, p, hdr->len - hdr_size(hdr));
+	fio_sha1_init(&sha1_ctx);
+	fio_sha1_update(&sha1_ctx, p, hdr->len - hdr_size(hdr));
 
 	if (!memcmp(vh->sha1, sha1_ctx.H, sizeof(sha1)))
 		return 0;
@@ -466,7 +459,7 @@ static int verify_io_u_crc7(struct verify_header *hdr, struct vcont *vc)
 
 	dprint(FD_VERIFY, "crc7 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	c = crc7(p, hdr->len - hdr_size(hdr));
+	c = fio_crc7(p, hdr->len - hdr_size(hdr));
 
 	if (c == vh->crc7)
 		return 0;
@@ -487,7 +480,7 @@ static int verify_io_u_crc16(struct verify_header *hdr, struct vcont *vc)
 
 	dprint(FD_VERIFY, "crc16 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	c = crc16(p, hdr->len - hdr_size(hdr));
+	c = fio_crc16(p, hdr->len - hdr_size(hdr));
 
 	if (c == vh->crc16)
 		return 0;
@@ -508,7 +501,7 @@ static int verify_io_u_crc64(struct verify_header *hdr, struct vcont *vc)
 
 	dprint(FD_VERIFY, "crc64 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	c = crc64(p, hdr->len - hdr_size(hdr));
+	c = fio_crc64(p, hdr->len - hdr_size(hdr));
 
 	if (c == vh->crc64)
 		return 0;
@@ -529,7 +522,7 @@ static int verify_io_u_crc32(struct verify_header *hdr, struct vcont *vc)
 
 	dprint(FD_VERIFY, "crc32 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	c = crc32(p, hdr->len - hdr_size(hdr));
+	c = fio_crc32(p, hdr->len - hdr_size(hdr));
 
 	if (c == vh->crc32)
 		return 0;
@@ -550,10 +543,7 @@ static int verify_io_u_crc32c(struct verify_header *hdr, struct vcont *vc)
 
 	dprint(FD_VERIFY, "crc32c verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	if (hdr->verify_type == VERIFY_CRC32C_INTEL)
-		c = crc32c_intel(p, hdr->len - hdr_size(hdr));
-	else
-		c = crc32c(p, hdr->len - hdr_size(hdr));
+	c = fio_crc32c(p, hdr->len - hdr_size(hdr));
 
 	if (c == vh->crc32)
 		return 0;
@@ -571,14 +561,14 @@ static int verify_io_u_md5(struct verify_header *hdr, struct vcont *vc)
 	void *p = io_u_verify_off(hdr, vc);
 	struct vhdr_md5 *vh = hdr_priv(hdr);
 	uint32_t hash[MD5_HASH_WORDS];
-	struct md5_ctx md5_ctx = {
+	struct fio_md5_ctx md5_ctx = {
 		.hash = hash,
 	};
 
 	dprint(FD_VERIFY, "md5 verify io_u %p, len %u\n", vc->io_u, hdr->len);
 
-	md5_init(&md5_ctx);
-	md5_update(&md5_ctx, p, hdr->len - hdr_size(hdr));
+	fio_md5_init(&md5_ctx);
+	fio_md5_update(&md5_ctx, p, hdr->len - hdr_size(hdr));
 
 	if (!memcmp(vh->md5_digest, md5_ctx.hash, sizeof(hash)))
 		return 0;
@@ -599,10 +589,8 @@ int verify_io_u_async(struct thread_data *td, struct io_u *io_u)
 	if (io_u->file)
 		put_file_log(td, io_u->file);
 
-	io_u->file = NULL;
-
 	pthread_mutex_lock(&td->io_u_lock);
-	
+
 	if (io_u->flags & IO_U_F_IN_CUR_DEPTH) {
 		td->cur_depth--;
 		io_u->flags &= ~IO_U_F_IN_CUR_DEPTH;
@@ -650,6 +638,26 @@ static int verify_trimmed_io_u(struct thread_data *td, struct io_u *io_u)
 	return ret;
 }
 
+static int verify_header(struct io_u *io_u, struct verify_header *hdr)
+{
+	void *p = hdr;
+	uint32_t crc;
+
+	if (hdr->magic != FIO_HDR_MAGIC)
+		return 0;
+	if (hdr->len > io_u->buflen) {
+		log_err("fio: verify header exceeds buffer length (%u > %lu)\n", hdr->len, io_u->buflen);
+		return 0;
+	}
+
+	crc = fio_crc32c(p, offsetof(struct verify_header, crc32));
+	if (crc == hdr->crc32)
+		return 1;
+
+	log_err("fio: verify header crc %x, calculated %x\n", hdr->crc32, crc);
+	return 0;
+}
+
 int verify_io_u(struct thread_data *td, struct io_u *io_u)
 {
 	struct verify_header *hdr;
@@ -674,6 +682,7 @@ int verify_io_u(struct thread_data *td, struct io_u *io_u)
 			.hdr_num	= hdr_num,
 			.td		= td,
 		};
+		unsigned int verify_type;
 
 		if (ret && td->o.verify_fatal)
 			break;
@@ -683,15 +692,21 @@ int verify_io_u(struct thread_data *td, struct io_u *io_u)
 			memswp(p, p + td->o.verify_offset, header_size);
 		hdr = p;
 
-		if (hdr->fio_magic != FIO_HDR_MAGIC) {
-			log_err("verify: bad magic header %x, wanted %x at file %s offset %llu, length %u\n",
-				hdr->fio_magic, FIO_HDR_MAGIC,
+		if (!verify_header(io_u, hdr)) {
+			log_err("verify: bad magic header %x, wanted %x at "
+				"file %s offset %llu, length %u\n",
+				hdr->magic, FIO_HDR_MAGIC,
 				io_u->file->file_name,
 				io_u->offset + hdr_num * hdr->len, hdr->len);
 			return EILSEQ;
 		}
 
-		switch (hdr->verify_type) {
+		if (td->o.verify != VERIFY_NONE)
+			verify_type = td->o.verify;
+		else
+			verify_type = hdr->verify_type;
+
+		switch (verify_type) {
 		case VERIFY_MD5:
 			ret = verify_io_u_md5(hdr, &vc);
 			break;
@@ -730,6 +745,10 @@ int verify_io_u(struct thread_data *td, struct io_u *io_u)
 			log_err("Bad verify type %u\n", hdr->verify_type);
 			ret = EINVAL;
 		}
+
+		if (ret && verify_type != hdr->verify_type)
+			log_err("fio: verify type mismatch (%u media, %u given)\n",
+					hdr->verify_type, verify_type);
 	}
 
 done:
@@ -757,83 +776,80 @@ static void fill_meta(struct verify_header *hdr, struct thread_data *td,
 static void fill_sha512(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_sha512 *vh = hdr_priv(hdr);
-	struct sha512_ctx sha512_ctx = {
+	struct fio_sha512_ctx sha512_ctx = {
 		.buf = vh->sha512,
 	};
 
-	sha512_init(&sha512_ctx);
-	sha512_update(&sha512_ctx, p, len);
+	fio_sha512_init(&sha512_ctx);
+	fio_sha512_update(&sha512_ctx, p, len);
 }
 
 static void fill_sha256(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_sha256 *vh = hdr_priv(hdr);
-	struct sha256_ctx sha256_ctx = {
+	struct fio_sha256_ctx sha256_ctx = {
 		.buf = vh->sha256,
 	};
 
-	sha256_init(&sha256_ctx);
-	sha256_update(&sha256_ctx, p, len);
+	fio_sha256_init(&sha256_ctx);
+	fio_sha256_update(&sha256_ctx, p, len);
 }
 
 static void fill_sha1(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_sha1 *vh = hdr_priv(hdr);
-	struct sha1_ctx sha1_ctx = {
+	struct fio_sha1_ctx sha1_ctx = {
 		.H = vh->sha1,
 	};
 
-	sha1_init(&sha1_ctx);
-	sha1_update(&sha1_ctx, p, len);
+	fio_sha1_init(&sha1_ctx);
+	fio_sha1_update(&sha1_ctx, p, len);
 }
 
 static void fill_crc7(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_crc7 *vh = hdr_priv(hdr);
 
-	vh->crc7 = crc7(p, len);
+	vh->crc7 = fio_crc7(p, len);
 }
 
 static void fill_crc16(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_crc16 *vh = hdr_priv(hdr);
 
-	vh->crc16 = crc16(p, len);
+	vh->crc16 = fio_crc16(p, len);
 }
 
 static void fill_crc32(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_crc32 *vh = hdr_priv(hdr);
 
-	vh->crc32 = crc32(p, len);
+	vh->crc32 = fio_crc32(p, len);
 }
 
 static void fill_crc32c(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_crc32 *vh = hdr_priv(hdr);
 
-	if (hdr->verify_type == VERIFY_CRC32C_INTEL)
-		vh->crc32 = crc32c_intel(p, len);
-	else
-		vh->crc32 = crc32c(p, len);
+	vh->crc32 = fio_crc32c(p, len);
 }
 
 static void fill_crc64(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_crc64 *vh = hdr_priv(hdr);
 
-	vh->crc64 = crc64(p, len);
+	vh->crc64 = fio_crc64(p, len);
 }
 
 static void fill_md5(struct verify_header *hdr, void *p, unsigned int len)
 {
 	struct vhdr_md5 *vh = hdr_priv(hdr);
-	struct md5_ctx md5_ctx = {
+	struct fio_md5_ctx md5_ctx = {
 		.hash = (uint32_t *) vh->md5_digest,
 	};
 
-	md5_init(&md5_ctx);
-	md5_update(&md5_ctx, p, len);
+	fio_md5_init(&md5_ctx);
+	fio_md5_update(&md5_ctx, p, len);
 }
 
 static void populate_hdr(struct thread_data *td, struct io_u *io_u,
@@ -845,10 +861,12 @@ static void populate_hdr(struct thread_data *td, struct io_u *io_u,
 
 	p = (void *) hdr;
 
-	hdr->fio_magic = FIO_HDR_MAGIC;
-	hdr->len = header_len;
+	hdr->magic = FIO_HDR_MAGIC;
 	hdr->verify_type = td->o.verify;
+	hdr->len = header_len;
 	hdr->rand_seed = io_u->rand_seed;
+	hdr->crc32 = fio_crc32c(p, offsetof(struct verify_header, crc32));
+
 	data_len = header_len - hdr_size(hdr);
 
 	data = p + hdr_size(hdr);
@@ -957,6 +975,7 @@ int get_next_verify(struct thread_data *td, struct io_u *io_u)
 		io_u->offset = ipo->offset;
 		io_u->buflen = ipo->len;
 		io_u->file = ipo->file;
+		io_u->flags |= IO_U_F_VER_LIST;
 
 		if (ipo->flags & IP_F_TRIMMED)
 			io_u->flags |= IO_U_F_TRIMMED;
@@ -1032,8 +1051,7 @@ static void *verify_async_thread(void *data)
 			put_io_u(td, io_u);
 			if (!ret)
 				continue;
-			if (td->o.continue_on_error &&
-			    td_non_fatal_error(ret)) {
+			if (td_non_fatal_error(td, ERROR_TYPE_VERIFY_BIT, ret)) {
 				update_error_count(td, ret);
 				td_clear_error(td);
 				ret = 0;

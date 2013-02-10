@@ -1,14 +1,9 @@
+#include <stdio.h>
 #include <string.h>
-#include <assert.h>
-
 #include "../flist.h"
-#include "../flist_sort.h"
+#include "../log.h"
 
-#ifndef ARRAY_SIZE
-#define	ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-#endif
-
-#define MAX_LIST_LENGTH_BITS 65
+#define MAX_LIST_LENGTH_BITS 20
 
 /*
  * Returns a list organized in an intermediate format suited
@@ -74,7 +69,7 @@ static void merge_and_restore_back_links(void *priv,
 		 * element comparison is needed, so the client's cmp()
 		 * routine can invoke cond_resched() periodically.
 		 */
-		cmp(priv, tail, tail);
+		(*cmp)(priv, tail->next, tail->next);
 
 		tail->next->prev = tail;
 		tail = tail->next;
@@ -85,8 +80,8 @@ static void merge_and_restore_back_links(void *priv,
 }
 
 /**
- * flist_sort - sort a list
- * @priv: private data, opaque to flist_sort(), passed to @cmp
+ * list_sort - sort a list
+ * @priv: private data, opaque to list_sort(), passed to @cmp
  * @head: the list to sort
  * @cmp: the elements comparison function
  *
@@ -126,7 +121,12 @@ void flist_sort(void *priv, struct flist_head *head,
 			part[lev] = NULL;
 		}
 		if (lev > max_lev) {
-			assert(lev < ARRAY_SIZE(part) - 1);
+			if (lev >= MAX_LIST_LENGTH_BITS) {
+				log_err("fio: list passed to"
+					" list_sort() too long for"
+					" efficiency\n");
+				lev--;
+			}
 			max_lev = lev;
 		}
 		part[lev] = cur;

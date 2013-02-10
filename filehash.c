@@ -3,7 +3,7 @@
 
 #include "fio.h"
 #include "flist.h"
-#include "crc/crc16.h"
+#include "hash.h"
 
 #define HASH_BUCKETS	512
 #define HASH_MASK	(HASH_BUCKETS - 1)
@@ -15,7 +15,7 @@ static struct fio_mutex *hash_lock;
 
 static unsigned short hash(const char *name)
 {
-	return crc16((const unsigned char *) name, strlen(name)) & HASH_MASK;
+	return jhash(name, strlen(name), 0) & HASH_MASK;
 }
 
 void remove_file_hash(struct fio_file *f)
@@ -107,5 +107,5 @@ void file_hash_init(void *ptr)
 	for (i = 0; i < HASH_BUCKETS; i++)
 		INIT_FLIST_HEAD(&file_hash[i]);
 
-	hash_lock = fio_mutex_init(1);
+	hash_lock = fio_mutex_init(FIO_MUTEX_UNLOCKED);
 }

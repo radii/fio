@@ -15,8 +15,6 @@
 
 #include "../fio.h"
 
-#ifdef FIO_HAVE_SPLICE
-
 struct spliceio_data {
 	int pipe[2];
 	int vmsplice_to_user;
@@ -204,7 +202,7 @@ static int fio_splice_write(struct thread_data *td, struct io_u *io_u)
 static int fio_spliceio_queue(struct thread_data *td, struct io_u *io_u)
 {
 	struct spliceio_data *sd = td->io_ops->data;
-	int uninitialized_var(ret);
+	int ret = 0;
 
 	fio_ro_check(td, io_u);
 
@@ -284,7 +282,7 @@ static int fio_spliceio_init(struct thread_data *td)
 	 * buffers. Just set ->odirect to force that.
 	 */
 	if (td_read(td))
-		td->o.odirect = 1;
+		td->o.mem_align = 1;
 
 	td->io_ops->data = sd;
 	return 0;
@@ -301,27 +299,6 @@ static struct ioengine_ops ioengine = {
 	.get_file_size	= generic_get_file_size,
 	.flags		= FIO_SYNCIO | FIO_PIPEIO,
 };
-
-#else /* FIO_HAVE_SPLICE */
-
-/*
- * When we have a proper configure system in place, we simply wont build
- * and install this io engine. For now install a crippled version that
- * just complains and fails to load.
- */
-static int fio_spliceio_init(struct thread_data fio_unused *td)
-{
-	log_err("fio: splice not available\n");
-	return 1;
-}
-
-static struct ioengine_ops ioengine = {
-	.name		= "splice",
-	.version	= FIO_IOOPS_VERSION,
-	.init		= fio_spliceio_init,
-};
-
-#endif
 
 static void fio_init fio_spliceio_register(void)
 {

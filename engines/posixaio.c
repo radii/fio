@@ -12,8 +12,6 @@
 
 #include "../fio.h"
 
-#ifdef FIO_HAVE_POSIXAIO
-
 struct posixaio_data {
 	struct io_u **aio_events;
 	unsigned int queued;
@@ -21,13 +19,25 @@ struct posixaio_data {
 
 static int fill_timespec(struct timespec *ts)
 {
-#ifdef _POSIX_TIMERS
-	if (!clock_gettime(CLOCK_MONOTONIC, ts))
+#ifdef CONFIG_CLOCK_GETTIME
+#ifdef CONFIG_CLOCK_MONOTONIC
+	clockid_t clk = CLOCK_MONOTONIC;
+#else
+	clockid_t clk = CLOCK_REALTIME;
+#endif
+	if (!clock_gettime(clk, ts))
 		return 0;
 
 	perror("clock_gettime");
-#endif
 	return 1;
+#else
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	ts->tv_sec = tv.tv_sec;
+	ts->tv_nsec = tv.tv_usec * 1000;
+	return 0;
+#endif
 }
 
 static unsigned long long ts_utime_since_now(struct timespec *t)
@@ -65,13 +75,14 @@ static int fio_posixaio_cancel(struct thread_data fio_unused *td,
 static int fio_posixaio_prep(struct thread_data fio_unused *td,
 			     struct io_u *io_u)
 {
-	struct aiocb *aiocb = &io_u->aiocb;
+	os_aiocb_t *aiocb = &io_u->aiocb;
 	struct fio_file *f = io_u->file;
 
 	aiocb->aio_fildes = f->fd;
 	aiocb->aio_buf = io_u->xfer_buf;
 	aiocb->aio_nbytes = io_u->xfer_buflen;
 	aiocb->aio_offset = io_u->offset;
+	aiocb->aio_sigevent.sigev_notify = SIGEV_NONE;
 
 	io_u->seen = 0;
 	return 0;
@@ -83,7 +94,7 @@ static int fio_posixaio_getevents(struct thread_data *td, unsigned int min,
 				  unsigned int max, struct timespec *t)
 {
 	struct posixaio_data *pd = td->io_ops->data;
-	struct aiocb *suspend_list[SUSPEND_ENTRIES];
+	os_aiocb_t *suspend_list[SUSPEND_ENTRIES];
 	struct flist_head *entry;
 	struct timespec start;
 	int have_timeout = 0;
@@ -92,6 +103,8 @@ static int fio_posixaio_getevents(struct thread_data *td, unsigned int min,
 
 	if (t && !fill_timespec(&start))
 		have_timeout = 1;
+	else
+		memset(&start, 0, sizeof(start));
 
 	r = 0;
 	memset(suspend_list, 0, sizeof(*suspend_list));
@@ -140,7 +153,7 @@ restart:
 	/*
 	 * must have some in-flight, wait for at least one
 	 */
-	aio_suspend((const struct aiocb * const *)suspend_list,
+	aio_suspend((const os_aiocb_t * const *)suspend_list,
 							suspend_entries, t);
 	goto restart;
 }
@@ -156,7 +169,7 @@ static int fio_posixaio_queue(struct thread_data *td,
 			      struct io_u *io_u)
 {
 	struct posixaio_data *pd = td->io_ops->data;
-	struct aiocb *aiocb = &io_u->aiocb;
+	os_aiocb_t *aiocb = &io_u->aiocb;
 	int ret;
 
 	fio_ro_check(td, io_u);
@@ -172,7 +185,7 @@ static int fio_posixaio_queue(struct thread_data *td,
 		do_io_u_trim(td, io_u);
 		return FIO_Q_COMPLETED;
 	} else {
-#ifdef FIO_HAVE_POSIXAIO_FSYNC
+#ifdef CONFIG_POSIXAIO_FSYNC
 		ret = aio_fsync(O_SYNC, aiocb);
 #else
 		if (pd->queued)
@@ -184,6 +197,15 @@ static int fio_posixaio_queue(struct thread_data *td,
 	}
 		
 	if (ret) {
+		/*
+		 * At least OSX has a very low limit on the number of pending
+		 * IOs, so if it returns EAGAIN, we are out of resources
+		 * to queue more. Just return FIO_Q_BUSY to naturally
+		 * drop off at this depth.
+		 */
+		if (errno == EAGAIN)
+			return FIO_Q_BUSY;
+
 		io_u->error = errno;
 		td_verror(td, io_u->error, "xfer");
 		return FIO_Q_COMPLETED;
@@ -229,27 +251,6 @@ static struct ioengine_ops ioengine = {
 	.close_file	= generic_close_file,
 	.get_file_size	= generic_get_file_size,
 };
-
-#else /* FIO_HAVE_POSIXAIO */
-
-/*
- * When we have a proper configure system in place, we simply wont build
- * and install this io engine. For now install a crippled version that
- * just complains and fails to load.
- */
-static int fio_posixaio_init(struct thread_data fio_unused *td)
-{
-	log_err("fio: posixaio not available\n");
-	return 1;
-}
-
-static struct ioengine_ops ioengine = {
-	.name		= "posixaio",
-	.version	= FIO_IOOPS_VERSION,
-	.init		= fio_posixaio_init,
-};
-
-#endif
 
 static void fio_init fio_posixaio_register(void)
 {

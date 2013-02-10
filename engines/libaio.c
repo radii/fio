@@ -9,12 +9,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <assert.h>
+#include <libaio.h>
 
 #include "../fio.h"
-
-#ifdef FIO_HAVE_LIBAIO
-
-#define ev_to_iou(ev)	(struct io_u *) ((unsigned long) (ev)->obj)
 
 struct libaio_data {
 	io_context_t aio_ctx;
@@ -22,6 +19,23 @@ struct libaio_data {
 	struct iocb **iocbs;
 	struct io_u **io_us;
 	int iocbs_nr;
+};
+
+struct libaio_options {
+	struct thread_data *td;
+	unsigned int userspace_reap;
+};
+
+static struct fio_option options[] = {
+	{
+		.name	= "userspace_reap",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct libaio_options, userspace_reap),
+		.help	= "Use alternative user-space reap implementation",
+	},
+	{
+		.name	= NULL,
+	},
 };
 
 static int fio_libaio_prep(struct thread_data fio_unused *td, struct io_u *io_u)
@@ -45,7 +59,7 @@ static struct io_u *fio_libaio_event(struct thread_data *td, int event)
 	struct io_u *io_u;
 
 	ev = ld->aio_events + event;
-	io_u = ev_to_iou(ev);
+	io_u = container_of(ev->obj, struct io_u, iocb);
 
 	if (ev->res != io_u->xfer_buflen) {
 		if (ev->res > io_u->xfer_buflen)
@@ -58,26 +72,73 @@ static struct io_u *fio_libaio_event(struct thread_data *td, int event)
 	return io_u;
 }
 
+struct aio_ring {
+	unsigned id;		 /** kernel internal index number */
+	unsigned nr;		 /** number of io_events */
+	unsigned head;
+	unsigned tail;
+
+	unsigned magic;
+	unsigned compat_features;
+	unsigned incompat_features;
+	unsigned header_length;	/** size of aio_ring */
+
+	struct io_event events[0];
+};
+
+#define AIO_RING_MAGIC	0xa10a10a1
+
+static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
+			     struct io_event *events)
+{
+	long i = 0;
+	unsigned head;
+	struct aio_ring *ring = (struct aio_ring*) aio_ctx;
+
+	while (i < max) {
+		head = ring->head;
+
+		if (head == ring->tail) {
+			/* There are no more completions */
+			break;
+		} else {
+			/* There is another completion to reap */
+			events[i] = ring->events[head];
+			read_barrier();
+			ring->head = (head + 1) % ring->nr;
+			i++;
+		}
+	}
+
+	return i;
+}
+
 static int fio_libaio_getevents(struct thread_data *td, unsigned int min,
 				unsigned int max, struct timespec *t)
 {
 	struct libaio_data *ld = td->io_ops->data;
-	int r;
+	struct libaio_options *o = td->eo;
+	unsigned actual_min = td->o.iodepth_batch_complete == 0 ? 0 : min;
+	int r, events = 0;
 
 	do {
-		r = io_getevents(ld->aio_ctx, min, max, ld->aio_events, t);
-		if (r >= (int) min)
-			break;
-		else if (r == -EAGAIN) {
+		if (o->userspace_reap == 1
+		    && actual_min == 0
+		    && ((struct aio_ring *)(ld->aio_ctx))->magic
+				== AIO_RING_MAGIC) {
+			r = user_io_getevents(ld->aio_ctx, max,
+				ld->aio_events + events);
+		} else {
+			r = io_getevents(ld->aio_ctx, actual_min,
+				max, ld->aio_events + events, t);
+		}
+		if (r >= 0)
+			events += r;
+		else if (r == -EAGAIN)
 			usleep(100);
-			continue;
-		} else if (r == -EINTR)
-			continue;
-		else if (r != 0)
-			break;
-	} while (1);
+	} while (events < min);
 
-	return r;
+	return r < 0 ? r : events;
 }
 
 static int fio_libaio_queue(struct thread_data *td, struct io_u *io_u)
@@ -191,11 +252,20 @@ static void fio_libaio_cleanup(struct thread_data *td)
 static int fio_libaio_init(struct thread_data *td)
 {
 	struct libaio_data *ld = malloc(sizeof(*ld));
-	int err;
+	struct libaio_options *o = td->eo;
+	int err = 0;
 
 	memset(ld, 0, sizeof(*ld));
 
-	err = io_queue_init(td->o.iodepth, &ld->aio_ctx);
+	/*
+	 * First try passing in 0 for queue depth, since we don't
+	 * care about the user ring. If that fails, the kernel is too old
+	 * and we need the right depth.
+	 */
+	if (!o->userspace_reap)
+		err = io_queue_init(INT_MAX, &ld->aio_ctx);
+	if (o->userspace_reap || err == -EINVAL)
+		err = io_queue_init(td->o.iodepth, &ld->aio_ctx);
 	if (err) {
 		td_verror(td, -err, "io_queue_init");
 		log_err("fio: check /proc/sys/fs/aio-max-nr\n");
@@ -216,41 +286,22 @@ static int fio_libaio_init(struct thread_data *td)
 }
 
 static struct ioengine_ops ioengine = {
-	.name		= "libaio",
-	.version	= FIO_IOOPS_VERSION,
-	.init		= fio_libaio_init,
-	.prep		= fio_libaio_prep,
-	.queue		= fio_libaio_queue,
-	.commit		= fio_libaio_commit,
-	.cancel		= fio_libaio_cancel,
-	.getevents	= fio_libaio_getevents,
-	.event		= fio_libaio_event,
-	.cleanup	= fio_libaio_cleanup,
-	.open_file	= generic_open_file,
-	.close_file	= generic_close_file,
-	.get_file_size	= generic_get_file_size,
+	.name			= "libaio",
+	.version		= FIO_IOOPS_VERSION,
+	.init			= fio_libaio_init,
+	.prep			= fio_libaio_prep,
+	.queue			= fio_libaio_queue,
+	.commit			= fio_libaio_commit,
+	.cancel			= fio_libaio_cancel,
+	.getevents		= fio_libaio_getevents,
+	.event			= fio_libaio_event,
+	.cleanup		= fio_libaio_cleanup,
+	.open_file		= generic_open_file,
+	.close_file		= generic_close_file,
+	.get_file_size		= generic_get_file_size,
+	.options		= options,
+	.option_struct_size	= sizeof(struct libaio_options),
 };
-
-#else /* FIO_HAVE_LIBAIO */
-
-/*
- * When we have a proper configure system in place, we simply wont build
- * and install this io engine. For now install a crippled version that
- * just complains and fails to load.
- */
-static int fio_libaio_init(struct thread_data fio_unused *td)
-{
-	log_err("fio: libaio not available\n");
-	return 1;
-}
-
-static struct ioengine_ops ioengine = {
-	.name		= "libaio",
-	.version	= FIO_IOOPS_VERSION,
-	.init		= fio_libaio_init,
-};
-
-#endif
 
 static void fio_init fio_libaio_register(void)
 {

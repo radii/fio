@@ -3,12 +3,7 @@
  *
  * IO engine using the GUASI library.
  *
- * This is currently disabled. To enable it, execute:
- *
- * $ export EXTFLAGS="-DFIO_HAVE_GUASI"
- * $ export EXTLIBS="-lguasi"
- *
- * before running make. You'll need the GUASI lib as well:
+ * Before running make. You'll need the GUASI lib as well:
  *
  * http://www.xmailserver.org/guasi-lib.html
  *
@@ -20,8 +15,6 @@
 #include <assert.h>
 
 #include "../fio.h"
-
-#ifdef FIO_HAVE_GUASI
 
 #define GFIO_MIN_THREADS 32
 #ifndef GFIO_MAX_THREADS
@@ -263,27 +256,6 @@ static struct ioengine_ops ioengine = {
 	.close_file	= generic_close_file,
 	.get_file_size	= generic_get_file_size,
 };
-
-#else /* FIO_HAVE_GUASI */
-
-/*
- * When we have a proper configure system in place, we simply wont build
- * and install this io engine. For now install a crippled version that
- * just complains and fails to load.
- */
-static int fio_guasi_init(struct thread_data fio_unused *td)
-{
-	log_err("fio: guasi not available\n");
-	return 1;
-}
-
-static struct ioengine_ops ioengine = {
-	.name		= "guasi",
-	.version	= FIO_IOOPS_VERSION,
-	.init		= fio_guasi_init,
-};
-
-#endif
 
 static void fio_init fio_guasi_register(void)
 {

@@ -1,7 +1,10 @@
 #ifndef FIO_OS_NETBSD_H
 #define FIO_OS_NETBSD_H
 
+#define	FIO_OS	os_netbsd
+
 #include <errno.h>
+#include <lwp.h>
 #include <sys/param.h>
 /* XXX hack to avoid confilcts between rbtree.h and <sys/rb.h> */
 #define	rb_node	_rb_node
@@ -12,13 +15,11 @@
 
 #include "../file.h"
 
-#define FIO_HAVE_POSIXAIO
-#define FIO_HAVE_FADVISE
 #define FIO_HAVE_ODIRECT
-#define FIO_HAVE_STRSEP
-#define FIO_HAVE_FDATASYNC
 #define FIO_USE_GENERIC_BDEV_SIZE
 #define FIO_USE_GENERIC_RAND
+#define FIO_USE_GENERIC_INIT_RANDOM_STATE
+#define FIO_HAVE_GETTID
 
 #undef	FIO_HAVE_CPU_AFFINITY	/* XXX notyet */
 
@@ -27,6 +28,10 @@
 #ifndef PTHREAD_STACK_MIN
 #define PTHREAD_STACK_MIN 4096
 #endif
+
+#define fio_swap16(x)	bswap16(x)
+#define fio_swap32(x)	bswap32(x)
+#define fio_swap64(x)	bswap64(x)
 
 typedef off_t off64_t;
 
@@ -43,6 +48,11 @@ static inline unsigned long long os_phys_mem(void)
 
 	sysctl(mib, 2, &mem, &len, NULL, 0);
 	return mem;
+}
+
+static inline int gettid(void)
+{
+	return (int) _lwp_self();
 }
 
 #ifdef MADV_FREE

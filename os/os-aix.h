@@ -1,6 +1,8 @@
 #ifndef FIO_OS_AIX_H
 #define FIO_OS_AIX_H
 
+#define	FIO_OS	os_aix
+
 #include <errno.h>
 #include <unistd.h>
 #include <sys/devinfo.h>
@@ -8,22 +10,16 @@
 
 #include "../file.h"
 
-#define FIO_HAVE_POSIXAIO
 #define FIO_HAVE_ODIRECT
 #define FIO_USE_GENERIC_RAND
-#define FIO_HAVE_CLOCK_MONOTONIC
-
-/*
- * This is broken on AIX if _LARGE_FILES is defined...
- */
-#if 0
-#define FIO_HAVE_FALLOCATE
-#endif
+#define FIO_USE_GENERIC_INIT_RANDOM_STATE
 
 #define FIO_HAVE_PSHARED_MUTEX
 
 #define OS_MAP_ANON		MAP_ANON
 #define OS_MSG_DONTWAIT		0
+
+#define FIO_USE_GENERIC_SWAP
 
 static inline int blockdev_invalidate_cache(struct fio_file *f)
 {

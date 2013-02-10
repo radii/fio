@@ -8,8 +8,11 @@ struct fio_mutex {
 	pthread_cond_t cond;
 	int value;
 	int waiters;
+};
 
-	int mutex_fd;
+enum {
+	FIO_MUTEX_LOCKED	= 0,
+	FIO_MUTEX_UNLOCKED	= 1,
 };
 
 extern struct fio_mutex *fio_mutex_init(int);

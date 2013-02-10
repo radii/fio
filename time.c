@@ -6,75 +6,6 @@
 static struct timeval genesis;
 static unsigned long ns_granularity;
 
-unsigned long long utime_since(struct timeval *s, struct timeval *e)
-{
-	long sec, usec;
-	unsigned long long ret;
-
-	sec = e->tv_sec - s->tv_sec;
-	usec = e->tv_usec - s->tv_usec;
-	if (sec > 0 && usec < 0) {
-		sec--;
-		usec += 1000000;
-	}
-
-	/*
-	 * time warp bug on some kernels?
-	 */
-	if (sec < 0 || (sec == 0 && usec < 0))
-		return 0;
-
-	ret = sec * 1000000ULL + usec;
-
-	return ret;
-}
-
-unsigned long long utime_since_now(struct timeval *s)
-{
-	struct timeval t;
-
-	fio_gettime(&t, NULL);
-	return utime_since(s, &t);
-}
-
-unsigned long mtime_since(struct timeval *s, struct timeval *e)
-{
-	long sec, usec, ret;
-
-	sec = e->tv_sec - s->tv_sec;
-	usec = e->tv_usec - s->tv_usec;
-	if (sec > 0 && usec < 0) {
-		sec--;
-		usec += 1000000;
-	}
-
-	sec *= 1000UL;
-	usec /= 1000UL;
-	ret = sec + usec;
-
-	/*
-	 * time warp bug on some kernels?
-	 */
-	if (ret < 0)
-		ret = 0;
-
-	return ret;
-}
-
-unsigned long mtime_since_now(struct timeval *s)
-{
-	struct timeval t;
-	void *p = __builtin_return_address(0);
-
-	fio_gettime(&t, p);
-	return mtime_since(s, &t);
-}
-
-unsigned long time_since_now(struct timeval *s)
-{
-	return mtime_since_now(s) / 1000;
-}
-
 /*
  * busy looping version for the last few usec
  */
@@ -122,7 +53,7 @@ void usec_sleep(struct thread_data *td, unsigned long usec)
 	} while (!td->terminate);
 }
 
-unsigned long mtime_since_genesis(void)
+uint64_t mtime_since_genesis(void)
 {
 	return mtime_since_now(&genesis);
 }

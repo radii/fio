@@ -16,7 +16,10 @@ fio resides in a git repo, the canonical place is:
 
 git://git.kernel.dk/fio.git
 
-The http protocol also works, path is the same.
+If you are inside a corporate firewall, git:// may not always work for
+you. In that case you can use the http protocol, path is the same:
+
+http://git.kernel.dk/fio.git
 
 Snapshots are frequently generated and they include the git meta data as
 well. You can download them here:
@@ -83,18 +86,11 @@ http://maillist.kernel.dk/fio-devel/
 Building
 --------
 
-Just type 'make' and 'make install'. If on BSD, for now you have to
-specify the BSD Makefile with -f and use gmake (not make), eg:
+Just type 'make' and 'make install'.
 
-$ gmake -f Makefile.FreeBSD && gmake -f Makefile.FreeBSD install
-
-Same goes for AIX:
-
-$ gmake -f Makefile.aix && gmake -f Makefile.aix install
-
-Likewise with OpenSolaris, use the Makefile.solaris to compile there.
-The OpenSolaris make should work fine. This might change in the
-future if I opt for an autoconf type setup.
+Note that GNU make is required. On BSD it's available from devel/gmake;
+on Solaris it's in the SUNWgmake package. On platforms where GNU make
+isn't the default, type 'gmake' instead of 'make'.
 
 If your compile fails with an error like this:
 
@@ -113,21 +109,24 @@ based distros, it's typically called libaio-devel.
 Windows
 -------
 
-On Windows Cygwin (http://www.cygwin.com) is required with at least
-devel/gcc4 and devel/make installed in order to build fio, and
-admin/cygrunsrv to run it. You can also install devel/git to fetch/update
-the source files. To create an MSI installer package, install WiX 3.6 from
-http://wix.sourceforge.net/releases/ and run dobuild.cmd from the
+On Windows Cygwin (http://www.cygwin.com/) is required in order to
+build fio. To create an MSI installer package install WiX 3.7 from
+http://wixtoolset.org and run dobuild.cmd from the
 os/windows directory.
 
-Before running fio you'll need to have a copy of cygserver running. Run 
-"/usr/bin/cygserver-config" from an elevated Cygwin shell (i.e. launch the
-Cygwin shell under the Administrator account) to configure it. Once
-configured, run "net start cygserver" to start it, or type
-"/usr/sbin/cygserver &" in the Cygwin shell to start a local copy. 
+How to compile FIO on 64-bit Windows:
 
-If fio exits with the message "Bad system call" it normally means that
-Cygserver isn't running.
+ 1. Install Cygwin (http://www.cygwin.com/setup.exe). Install 'make' and all
+    packages starting with 'mingw64-i686' and 'mingw64-x86_64'.
+ 2. Download ftp://sourceware.org/pub/pthreads-win32/prebuilt-dll-2-9-1-release/dll/x64/pthreadGC2.dll
+    and copy to the fio source directory.
+ 3. Open the Cygwin Terminal.
+ 4. Go to the fio directory (source files).
+ 5. Run 'make clean'.
+ 6. Run 'make'.
+
+To build fio on 32-bit Windows, download x86/pthreadGC2.dll instead and do
+'./configure --build-32bit-win=yes' before 'make'.
 
 
 Command line
@@ -136,20 +135,33 @@ Command line
 $ fio
 	--debug			Enable some debugging options (see below)
 	--output		Write output to file
-	--timeout		Runtime in seconds
-	--latency-log	Generate per-job latency logs
-	--bandwidth-log	Generate per-job bandwidth logs
+	--runtime		Runtime in seconds
+	--latency-log		Generate per-job latency logs
+	--bandwidth-log		Generate per-job bandwidth logs
 	--minimal		Minimal (terse) output
+	--output-format=type	Output format (terse,json,normal)
+	--terse-version=type	Terse version output format (default 3, or 2 or 4).
 	--version		Print version info and exit
 	--help			Print this page
-	--cmdhelp=cmd	Print command help, "all" for all of them
+	--cpuclock-test		Perform test/validation of CPU clock
+	--cmdhelp=cmd		Print command help, "all" for all of them
+	--enghelp=engine	Print ioengine help, or list available ioengines
+	--enghelp=engine,cmd	Print help for an ioengine cmd
 	--showcmd		Turn a job file into command line options
-	--readonly		Turn on safety read-only checks, preventing writes
+	--readonly		Turn on safety read-only checks, preventing
+				writes
 	--eta=when		When ETA estimate should be printed
-					May be "always", "never" or "auto"
-	--section=name	Only run specified section in job file
-	--alloc-size=kb	Set smalloc pool to this size in kb (def 1024)
-	--warnings-fatal Fio parser warnings are fatal
+				May be "always", "never" or "auto"
+	--section=name		Only run specified section in job file.
+				Multiple sections can be specified.
+	--alloc-size=kb		Set smalloc pool to this size in kb (def 1024)
+	--warnings-fatal	Fio parser warnings are fatal
+	--max-jobs		Maximum number of threads/processes to support
+	--server=args		Start backend server. See Client/Server section.
+	--client=host		Connect to specified backend.
+	--idle-prof=option	Report cpu idleness on a system or percpu basis
+				(option=system,percpu) or run unit work
+				calibration only (option=calibrate).
 
 
 Any parameters following the options will be assumed to be job files,
@@ -168,11 +180,11 @@ options in fio. Currently the options are:
 
 	process		Dump info related to processes
 	file		Dump info related to file actions
-	io			Dump info related to IO queuing
-	mem			Dump info related to memory allocations
+	io		Dump info related to IO queuing
+	mem		Dump info related to memory allocations
 	blktrace	Dump info related to blktrace setup
 	verify		Dump info related to IO verification
-	all			Enable all debug options
+	all		Enable all debug options
 	random		Dump info related to random offset generation
 	parse		Dump info related to option matching and parsing
 	diskutil	Dump info related to disk utilization updates
@@ -239,10 +251,11 @@ The job file parameters are:
 			readv/writev (with queuing emulation) mmap for mmap'ed
 			io, syslet-rw for syslet driven read/write, splice for
 			using splice/vmsplice, sg for direct SG_IO io, net
-			for network io, or cpuio for a cycler burner load. sg
-			only works on Linux on SCSI (or SCSI-like devices, such
-			as usb-storage or sata/libata driven) devices. Fio also
-			has a null io engine, which is mainly used for testing
+			for network io, rdma for RDMA io, or cpuio for a
+			cycler burner load. sg only works on Linux on
+			SCSI (or SCSI-like devices, such as usb-storage or
+			sata/libata driven) devices. Fio also has a null
+			io engine, which is mainly used for testing
 			fio itself.
 
 	iodepth=x	For async io, allow 'x' ios in flight
@@ -261,6 +274,11 @@ The job file parameters are:
 	ratecycle=x	ratemin averaged over x msecs
 	cpumask=x	Only allow job to run on CPUs defined by mask.
 	cpus_allowed=x	Like 'cpumask', but allow text setting of CPU affinity.
+	numa_cpu_nodes=x,y-z  Allow job to run on specified NUMA nodes' CPU.
+	numa_mem_policy=m:x,y-z  Setup numa memory allocation policy.
+			'm' stands for policy, such as local, interleave,
+			bind, prefer, local. 'x, y-z' are numa node(s) for
+			memory allocation according to policy.
 	fsync=x		If writing with buffered IO, fsync after every
 			'x' blocks have been written.
 	end_fsync=x	If 'x', run fsync() after end-of-job.
@@ -293,11 +311,8 @@ The job file parameters are:
 			can be used to gauge hard drive speed over the entire
 			platter, without reading everything. Both x/y can
 			include k/m/g suffix.
-	iolog=x		Open and read io pattern from file 'x'. The file must
-			contain one io action per line in the following format:
-			rw, offset, length
-			where with rw=0/1 for read/write, and the offset
-			and length entries being in bytes.
+	read_iolog=x	Open and read io pattern from file 'x'. The file format
+                        is described in the HOWTO.
 	write_iolog=x	Write an iolog to file 'x' in the same format as iolog.
 			The iolog options are exclusive, if both given the
 			read iolog will be performed.  Specify a separate file
@@ -318,13 +333,70 @@ The job file parameters are:
 
 
 
+Client/server
+------------
+
+Normally you would run fio as a stand-alone application on the machine
+where the IO workload should be generated. However, it is also possible to
+run the frontend and backend of fio separately. This makes it possible to
+have a fio server running on the machine(s) where the IO workload should
+be running, while controlling it from another machine.
+
+To start the server, you would do:
+
+fio --server=args
+
+on that machine, where args defines what fio listens to. The arguments
+are of the form 'type,hostname or IP,port'. 'type' is either 'ip' (or ip4)
+for TCP/IP v4, 'ip6' for TCP/IP v6, or 'sock' for a local unix domain socket.
+'hostname' is either a hostname or IP address, and 'port' is the port to
+listen to (only valid for TCP/IP, not a local socket). Some examples:
+
+1) fio --server
+
+   Start a fio server, listening on all interfaces on the default port (8765).
+
+2) fio --server=ip:hostname,4444
+
+   Start a fio server, listening on IP belonging to hostname and on port 4444.
+
+3) fio --server=ip6:::1,4444
+
+   Start a fio server, listening on IPv6 localhost ::1 and on port 4444.
+
+4) fio --server=,4444
+
+   Start a fio server, listening on all interfaces on port 4444.
+
+5) fio --server=1.2.3.4
+
+   Start a fio server, listening on IP 1.2.3.4 on the default port.
+
+6) fio --server=sock:/tmp/fio.sock
+
+   Start a fio server, listening on the local socket /tmp/fio.sock.
+
+When a server is running, you can connect to it from a client. The client
+is run with:
+
+fio --local-args --client=server --remote-args <job file(s)>
+
+where --local-args are arguments that are local to the client where it is
+running, 'server' is the connect string, and --remote-args and <job file(s)>
+are sent to the server. The 'server' string follows the same format as it
+does on the server side, to allow IP/hostname/socket and port strings.
+You can connect to multiple clients as well, to do that you could run:
+
+fio --client=server2 <job file(s)> --client=server2 <job file(s)>
+
+
 Platforms
 ---------
 
-Fio works on (at least) Linux, Solaris, AIX, OSX, NetBSD, Windows and FreeBSD.
-Some features and/or options may only be available on some of the platforms,
-typically because those features only apply to that platform (like the
-solarisaio engine, or the splice engine on Linux).
+Fio works on (at least) Linux, Solaris, AIX, HP-UX, OSX, NetBSD, Windows
+and FreeBSD.  Some features and/or options may only be available on some of
+the platforms, typically because those features only apply to that platform
+(like the solarisaio engine, or the splice engine on Linux).
 
 Some features are not available on FreeBSD/Solaris even if they could be
 implemented, I'd be happy to take patches for that. An example of that is

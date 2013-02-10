@@ -104,7 +104,9 @@ static struct ioengine_ops *dlopen_ioengine(struct thread_data *td,
 	 * Unlike the included modules, external engines should have a
 	 * non-static ioengine structure that we can reference.
 	 */
-	ops = dlsym(dlhandle, "ioengine");
+	ops = dlsym(dlhandle, engine_lib);
+	if (!ops)
+		ops = dlsym(dlhandle, "ioengine");
 	if (!ops) {
 		td_vmsg(td, -1, dlerror(), "dlsym");
 		dlclose(dlhandle);
@@ -152,6 +154,26 @@ struct ioengine_ops *load_ioengine(struct thread_data *td, const char *name)
 	return ret;
 }
 
+/*
+ * For cleaning up an ioengine which never made it to init().
+ */
+void free_ioengine(struct thread_data *td)
+{
+	dprint(FD_IO, "free ioengine %s\n", td->io_ops->name);
+
+	if (td->eo && td->io_ops->options) {
+		options_free(td->io_ops->options, td->eo);
+		free(td->eo);
+		td->eo = NULL;
+	}
+
+	if (td->io_ops->dlhandle)
+		dlclose(td->io_ops->dlhandle);
+
+	free(td->io_ops);
+	td->io_ops = NULL;
+}
+
 void close_ioengine(struct thread_data *td)
 {
 	dprint(FD_IO, "close ioengine %s\n", td->io_ops->name);
@@ -161,11 +183,7 @@ void close_ioengine(struct thread_data *td)
 		td->io_ops->data = NULL;
 	}
 
-	if (td->io_ops->dlhandle)
-		dlclose(td->io_ops->dlhandle);
-
-	free(td->io_ops);
-	td->io_ops = NULL;
+	free_ioengine(td);
 }
 
 int td_io_prep(struct thread_data *td, struct io_u *io_u)
@@ -192,6 +210,16 @@ int td_io_getevents(struct thread_data *td, unsigned int min, unsigned int max,
 {
 	int r = 0;
 
+	/*
+	 * For ioengine=rdma one side operation RDMA_WRITE or RDMA_READ,
+	 * server side gets a message from the client
+	 * side that the task is finished, and
+	 * td->done is set to 1 after td_io_commit(). In this case,
+	 * there is no need to reap complete event in server side.
+	 */
+	if (td->done)
+		return 0;
+
 	if (min > 0 && td->io_ops->commit) {
 		r = td->io_ops->commit(td);
 		if (r < 0)
@@ -206,9 +234,14 @@ int td_io_getevents(struct thread_data *td, unsigned int min, unsigned int max,
 	if (max && td->io_ops->getevents)
 		r = td->io_ops->getevents(td, min, max, t);
 out:
-	if (r >= 0)
+	if (r >= 0) {
+		/*
+ 		 * Reflect that our submitted requests were retrieved with
+		 * whatever OS async calls are in the underlying engine.
+		 */
+		td->io_u_in_flight -= r;
 		io_u_mark_complete(td, r);
-	else
+	} else
 		td_verror(td, r, "get_events");
 
 	dprint(FD_IO, "getevents: %d\n", r);
@@ -227,6 +260,11 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 
 	assert(fio_file_open(io_u->file));
 
+	/*
+	 * If using a write iolog, store this entry.
+	 */
+	log_io_u(td, io_u);
+
 	io_u->error = 0;
 	io_u->resid = 0;
 
@@ -242,8 +280,8 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 					sizeof(struct timeval));
 	}
 
-	if (ddir_rw(io_u->ddir))
-		td->io_issues[io_u->ddir]++;
+	if (ddir_rw(acct_ddir(io_u)))
+		td->io_issues[acct_ddir(io_u)]++;
 
 	ret = td->io_ops->queue(td, io_u);
 
@@ -257,11 +295,12 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 	 */
 	if (io_u->error == EINVAL && td->io_issues[io_u->ddir & 1] == 1 &&
 	    td->o.odirect) {
+
 		log_info("fio: first direct IO errored. File system may not "
 			 "support direct IO, or iomem_align= is bad.\n");
 	}
 
-	if (!td->io_ops->commit) {
+	if (!td->io_ops->commit || ddir_trim(io_u->ddir)) {
 		io_u_mark_submit(td, 1);
 		io_u_mark_complete(td, 1);
 	}
@@ -270,8 +309,7 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 		if (ddir_rw(io_u->ddir)) {
 			io_u_mark_depth(td, 1);
 			td->ts.total_io_u[io_u->ddir]++;
-		} else if (io_u->ddir == DDIR_TRIM)
-			td->ts.total_io_u[2]++;
+		}
 	} else if (ret == FIO_Q_QUEUED) {
 		int r;
 
@@ -312,6 +350,8 @@ int td_io_init(struct thread_data *td)
 			log_err("fio: io engine init failed. Perhaps try"
 				" reducing io depth?\n");
 		}
+		if (!td->error)
+			td->error = ret;
 	}
 
 	return ret;
@@ -326,14 +366,19 @@ int td_io_commit(struct thread_data *td)
 	if (!td->cur_depth || !td->io_u_queued)
 		return 0;
 
-	io_u_mark_depth(td, td->io_u_queued);
-	td->io_u_queued = 0;
+	io_u_mark_depth(td, td->io_u_queued);	
 
 	if (td->io_ops->commit) {
 		ret = td->io_ops->commit(td);
 		if (ret)
 			td_verror(td, -ret, "io commit");
 	}
+	
+	/*
+	 * Reflect that events were submitted as async IO requests.
+	 */
+	td->io_u_in_flight += td->io_u_queued;
+	td->io_u_queued = 0;
 
 	return 0;
 }
@@ -357,7 +402,7 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
 		return 1;
 	}
 
-	fio_file_reset(f);
+	fio_file_reset(td, f);
 	fio_file_set_open(f);
 	fio_file_clear_closing(f);
 	disk_util_inc(f->du);
@@ -463,7 +508,7 @@ int do_io_u_sync(struct thread_data *td, struct io_u *io_u)
 	if (io_u->ddir == DDIR_SYNC) {
 		ret = fsync(io_u->file->fd);
 	} else if (io_u->ddir == DDIR_DATASYNC) {
-#ifdef FIO_HAVE_FDATASYNC
+#ifdef CONFIG_FDATASYNC
 		ret = fdatasync(io_u->file->fd);
 #else
 		ret = io_u->xfer_buflen;
@@ -498,4 +543,44 @@ int do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 	io_u->error = ret;
 	return 0;
 #endif
+}
+
+int fio_show_ioengine_help(const char *engine)
+{
+	struct flist_head *entry;
+	struct thread_data td;
+	char *sep;
+	int ret = 1;
+
+	if (!engine || !*engine) {
+		log_info("Available IO engines:\n");
+		flist_for_each(entry, &engine_list) {
+			td.io_ops = flist_entry(entry, struct ioengine_ops,
+						list);
+			log_info("\t%s\n", td.io_ops->name);
+		}
+		return 0;
+	}
+	sep = strchr(engine, ',');
+	if (sep) {
+		*sep = 0;
+		sep++;
+	}
+
+	memset(&td, 0, sizeof(td));
+
+	td.io_ops = load_ioengine(&td, engine);
+	if (!td.io_ops) {
+		log_info("IO engine %s not found\n", engine);
+		return 1;
+	}
+
+	if (td.io_ops->options)
+		ret = show_cmd_help(td.io_ops->options, sep);
+	else
+		log_info("IO engine %s has no options\n", td.io_ops->name);
+
+	free_ioengine(&td);
+
+	return ret;
 }
