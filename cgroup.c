@@ -22,7 +22,8 @@ struct cgroup_member {
 static char *find_cgroup_mnt(struct thread_data *td)
 {
 	char *mntpoint = NULL;
-	struct mntent *mnt;
+	struct mntent *mnt, dummy;
+	char buf[256] = {0};
 	FILE *f;
 
 	f = setmntent("/proc/mounts", "r");
@@ -31,7 +32,7 @@ static char *find_cgroup_mnt(struct thread_data *td)
 		return NULL;
 	}
 
-	while ((mnt = getmntent(f)) != NULL) {
+	while ((mnt = getmntent_r(f, &dummy, buf, sizeof(buf))) != NULL) {
 		if (!strcmp(mnt->mnt_type, "cgroup") &&
 		    strstr(mnt->mnt_opts, "blkio"))
 			break;
@@ -51,9 +52,22 @@ static void add_cgroup(struct thread_data *td, const char *name,
 {
 	struct cgroup_member *cm;
 
+	if (!lock)
+		return;
+
 	cm = smalloc(sizeof(*cm));
+	if (!cm) {
+err:
+		log_err("fio: failed to allocate cgroup member\n");
+		return;
+	}
+
 	INIT_FLIST_HEAD(&cm->list);
 	cm->root = smalloc_strdup(name);
+	if (!cm->root) {
+		sfree(cm);
+		goto err;
+	}
 	if (td->o.cgroup_nodelete)
 		cm->cgroup_nodelete = 1;
 	fio_mutex_down(lock);
@@ -65,6 +79,9 @@ void cgroup_kill(struct flist_head *clist)
 {
 	struct flist_head *n, *tmp;
 	struct cgroup_member *cm;
+
+	if (!lock)
+		return;
 
 	fio_mutex_down(lock);
 
@@ -85,9 +102,9 @@ static char *get_cgroup_root(struct thread_data *td, char *mnt)
 	char *str = malloc(64);
 
 	if (td->o.cgroup)
-		sprintf(str, "%s/%s", mnt, td->o.cgroup);
+		sprintf(str, "%s%s%s", mnt, FIO_OS_PATH_SEPARATOR, td->o.cgroup);
 	else
-		sprintf(str, "%s/%s", mnt, td->o.name);
+		sprintf(str, "%s%s%s", mnt, FIO_OS_PATH_SEPARATOR, td->o.name);
 
 	return str;
 }
@@ -98,8 +115,8 @@ static int write_int_to_file(struct thread_data *td, const char *path,
 {
 	char tmp[256];
 	FILE *f;
-	
-	sprintf(tmp, "%s/%s", path, filename);
+
+	sprintf(tmp, "%s%s%s", path, FIO_OS_PATH_SEPARATOR, filename);
 	f = fopen(tmp, "w");
 	if (!f) {
 		td_verror(td, errno, onerr);
@@ -181,7 +198,9 @@ void cgroup_shutdown(struct thread_data *td, char **mnt)
 
 static void fio_init cgroup_init(void)
 {
-	lock = fio_mutex_init(1);
+	lock = fio_mutex_init(FIO_MUTEX_UNLOCKED);
+	if (!lock)
+		log_err("fio: failed to allocate cgroup lock\n");
 }
 
 static void fio_exit cgroup_exit(void)

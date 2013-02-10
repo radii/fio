@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <string.h>
 #include <unistd.h>
+#include <inttypes.h>
 #include <sys/types.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -35,15 +36,14 @@ struct pool {
 	struct fio_mutex *lock;			/* protects this pool */
 	void *map;				/* map of blocks */
 	unsigned int *bitmap;			/* blocks free/busy map */
-	unsigned int free_blocks;		/* free blocks */
-	unsigned int nr_blocks;			/* total blocks */
-	unsigned int next_non_full;
-	int fd;					/* memory backing fd */
-	unsigned int mmap_size;
+	size_t free_blocks;		/* free blocks */
+	size_t nr_blocks;			/* total blocks */
+	size_t next_non_full;
+	size_t mmap_size;
 };
 
 struct block_hdr {
-	unsigned int size;
+	size_t size;
 #ifdef SMALLOC_REDZONE
 	unsigned int prered;
 #endif
@@ -91,13 +91,13 @@ static inline int ptr_valid(struct pool *pool, void *ptr)
 	return (ptr >= pool->map) && (ptr < pool->map + pool_size);
 }
 
-static inline unsigned int size_to_blocks(unsigned int size)
+static inline size_t size_to_blocks(size_t size)
 {
 	return (size + SMALLOC_BPB - 1) / SMALLOC_BPB;
 }
 
 static int blocks_iter(struct pool *pool, unsigned int pool_idx,
-		       unsigned int idx, unsigned int nr_blocks,
+		       unsigned int idx, size_t nr_blocks,
 		       int (*func)(unsigned int *map, unsigned int mask))
 {
 
@@ -152,19 +152,19 @@ static int mask_set(unsigned int *map, unsigned int mask)
 }
 
 static int blocks_free(struct pool *pool, unsigned int pool_idx,
-		       unsigned int idx, unsigned int nr_blocks)
+		       unsigned int idx, size_t nr_blocks)
 {
 	return blocks_iter(pool, pool_idx, idx, nr_blocks, mask_cmp);
 }
 
 static void set_blocks(struct pool *pool, unsigned int pool_idx,
-		       unsigned int idx, unsigned int nr_blocks)
+		       unsigned int idx, size_t nr_blocks)
 {
 	blocks_iter(pool, pool_idx, idx, nr_blocks, mask_set);
 }
 
 static void clear_blocks(struct pool *pool, unsigned int pool_idx,
-			 unsigned int idx, unsigned int nr_blocks)
+			 unsigned int idx, size_t nr_blocks)
 {
 	blocks_iter(pool, pool_idx, idx, nr_blocks, mask_clear);
 }
@@ -172,19 +172,14 @@ static void clear_blocks(struct pool *pool, unsigned int pool_idx,
 static int find_next_zero(int word, int start)
 {
 	assert(word != -1U);
-	word >>= (start + 1);
-	return ffz(word) + start + 1;
+	word >>= start;
+	return ffz(word) + start;
 }
 
 static int add_pool(struct pool *pool, unsigned int alloc_size)
 {
-	int fd, bitmap_blocks;
-	char file[] = "/tmp/.fio_smalloc.XXXXXX";
+	int bitmap_blocks;
 	void *ptr;
-
-	fd = mkstemp(file);
-	if (fd < 0)
-		goto out_close;
 
 #ifdef SMALLOC_REDZONE
 	alloc_size += sizeof(unsigned int);
@@ -202,42 +197,25 @@ static int add_pool(struct pool *pool, unsigned int alloc_size)
 	pool->nr_blocks = bitmap_blocks;
 	pool->free_blocks = bitmap_blocks * SMALLOC_BPB;
 
-#ifdef FIO_HAVE_FALLOCATE
-	posix_fallocate(fd, 0, alloc_size);
-#endif
-
-	if (ftruncate(fd, alloc_size) < 0)
-		goto out_unlink;
-
-	ptr = mmap(NULL, alloc_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	ptr = mmap(NULL, alloc_size, PROT_READ|PROT_WRITE,
+			MAP_SHARED | OS_MAP_ANON, -1, 0);
 	if (ptr == MAP_FAILED)
-		goto out_unlink;
+		goto out_fail;
 
 	memset(ptr, 0, alloc_size);
 	pool->map = ptr;
 	pool->bitmap = (void *) ptr + (pool->nr_blocks * SMALLOC_BPL);
 
-	pool->lock = fio_mutex_init(1);
+	pool->lock = fio_mutex_init(FIO_MUTEX_UNLOCKED);
 	if (!pool->lock)
-		goto out_unlink;
-
-	/*
-	 * Unlink pool file now. It wont get deleted until the fd is closed,
-	 * which happens both for cleanup or unexpected quit. This way we
-	 * don't leave temp files around in case of a crash.
-	 */
-	unlink(file);
-	pool->fd = fd;
+		goto out_fail;
 
 	nr_pools++;
 	return 0;
-out_unlink:
+out_fail:
 	fprintf(stderr, "smalloc: failed adding pool\n");
 	if (pool->map)
 		munmap(pool->map, pool->mmap_size);
-	unlink(file);
-out_close:
-	close(fd);
 	return 1;
 }
 
@@ -256,7 +234,6 @@ static void cleanup_pool(struct pool *pool)
 	 * This will also remove the temporary file we used as a backing
 	 * store, it was already unlinked
 	 */
-	close(pool->fd);
 	munmap(pool->map, pool->mmap_size);
 
 	if (pool->lock)
@@ -277,9 +254,9 @@ void scleanup(void)
 #ifdef SMALLOC_REDZONE
 static void *postred_ptr(struct block_hdr *hdr)
 {
-	unsigned long ptr;
+	uintptr_t ptr;
 
-	ptr = (unsigned long) hdr + hdr->size - sizeof(unsigned int);
+	ptr = (uintptr_t) hdr + hdr->size - sizeof(unsigned int);
 	ptr = (ptr + int_mask) & ~int_mask;
 
 	return (void *) ptr;
@@ -371,9 +348,9 @@ void sfree(void *ptr)
 	sfree_pool(pool, ptr);
 }
 
-static void *__smalloc_pool(struct pool *pool, unsigned int size)
+static void *__smalloc_pool(struct pool *pool, size_t size)
 {
-	unsigned int nr_blocks;
+	size_t nr_blocks;
 	unsigned int i;
 	unsigned int offset;
 	unsigned int last_idx;
@@ -426,9 +403,9 @@ fail:
 	return ret;
 }
 
-static void *smalloc_pool(struct pool *pool, unsigned int size)
+static void *smalloc_pool(struct pool *pool, size_t size)
 {
-	unsigned int alloc_size = size + sizeof(struct block_hdr);
+	size_t alloc_size = size + sizeof(struct block_hdr);
 	void *ptr;
 
 	/*
@@ -454,9 +431,12 @@ static void *smalloc_pool(struct pool *pool, unsigned int size)
 	return ptr;
 }
 
-void *smalloc(unsigned int size)
+void *smalloc(size_t size)
 {
 	unsigned int i;
+
+	if (size != (unsigned int) size)
+		return NULL;
 
 	global_write_lock();
 	i = last_pool;

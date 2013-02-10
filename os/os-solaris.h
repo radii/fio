@@ -1,36 +1,66 @@
 #ifndef FIO_OS_SOLARIS_H
 #define FIO_OS_SOLARIS_H
 
+#define	FIO_OS	os_solaris
+
 #include <errno.h>
 #include <malloc.h>
 #include <sys/types.h>
 #include <sys/fcntl.h>
 #include <sys/pset.h>
+#include <sys/mman.h>
+#include <sys/dkio.h>
+#include <sys/byteorder.h>
 
 #include "../file.h"
 
-#define FIO_HAVE_POSIXAIO
-#define FIO_HAVE_SOLARISAIO
-#define FIO_HAVE_FALLOCATE
-#define FIO_HAVE_POSIXAIO_FSYNC
 #define FIO_HAVE_CPU_AFFINITY
 #define FIO_HAVE_PSHARED_MUTEX
+#define FIO_HAVE_CHARDEV_SIZE
 #define FIO_USE_GENERIC_BDEV_SIZE
-#define FIO_HAVE_FDATASYNC
+#define FIO_USE_GENERIC_INIT_RANDOM_STATE
+#define FIO_HAVE_GETTID
 
 #define OS_MAP_ANON		MAP_ANON
 #define OS_RAND_MAX		2147483648UL
+
+#define fio_swap16(x)	BSWAP_16(x)
+#define fio_swap32(x)	BSWAP_32(x)
+#define fio_swap64(x)	BSWAP_64(x)
 
 struct solaris_rand_seed {
 	unsigned short r[3];
 };
 
+#ifndef POSIX_MADV_SEQUENTIAL
+#define posix_madvise	madvise
+#define POSIX_MADV_SEQUENTIAL	MADV_SEQUENTIAL
+#define POSIX_MADV_DONTNEED	MADV_DONTNEED
+#define POSIX_MADV_RANDOM	MADV_RANDOM
+#endif
+
+#define os_ctime_r(x, y, z)     ctime_r((x), (y), (z))
+#define FIO_OS_HAS_CTIME_R
+
 typedef psetid_t os_cpu_mask_t;
 typedef struct solaris_rand_seed os_random_state_t;
 
+static inline int chardev_size(struct fio_file *f, unsigned long long *bytes)
+{
+	struct dk_minfo info;
+
+	*bytes = 0;
+
+	if (ioctl(f->fd, DKIOCGMEDIAINFO, &info) < 0)
+		return errno;
+
+	*bytes = info.dki_lbsize * info.dki_capacity;
+	return 0;
+}
+
 static inline int blockdev_invalidate_cache(struct fio_file *f)
 {
-	return EINVAL;
+	return 0;
 }
 
 static inline unsigned long long os_phys_mem(void)
@@ -75,26 +105,23 @@ static inline int fio_set_odirect(int fd)
 
 static inline int fio_cpuset_init(os_cpu_mask_t *mask)
 {
-	int ret;
-
-	if (pset_create(mask) < 0) {
-		ret = errno;
+	if (pset_create(mask) < 0)
 		return -1;
-	}
 
 	return 0;
 }
 
 static inline int fio_cpuset_exit(os_cpu_mask_t *mask)
 {
-	int ret;
-
-	if (pset_destroy(*mask) < 0) {
-		ret = errno;
+	if (pset_destroy(*mask) < 0)
 		return -1;
-	}
 
 	return 0;
+}
+
+static inline int gettid(void)
+{
+	return pthread_self();
 }
 
 /*

@@ -1,7 +1,7 @@
 #ifndef ARCH_PPC_H
 #define ARCH_PPH_H
 
-#define ARCH	(arch_ppc)
+#define FIO_ARCH	(arch_ppc)
 
 #ifndef __NR_ioprio_set
 #define __NR_ioprio_set		273
@@ -56,6 +56,14 @@ static inline unsigned long long get_cpu_clock(void)
 
 	ret = (((unsigned long long)tbu0) << 32) | tbl;
 	return ret;
+}
+
+#define ARCH_HAVE_INIT
+extern int tsc_reliable;
+static inline int arch_init(char *envp[])
+{
+	tsc_reliable = 1;
+	return 0;
 }
 
 #define ARCH_HAVE_FFZ

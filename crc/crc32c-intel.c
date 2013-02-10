@@ -18,6 +18,8 @@
  * Volume 2A: Instruction Set Reference, A-M
  */
 
+int crc32c_intel_available = 0;
+
 #ifdef ARCH_HAVE_SSE4_2
 
 #if BITS_PER_LONG == 64
@@ -28,8 +30,10 @@
 #define SCALE_F 4
 #endif
 
-uint32_t crc32c_intel_le_hw_byte(uint32_t crc, unsigned char const *data,
-				 unsigned long length)
+static int crc32c_probed;
+
+static uint32_t crc32c_intel_le_hw_byte(uint32_t crc, unsigned char const *data,
+					unsigned long length)
 {
 	while (length--) {
 		__asm__ __volatile__(
@@ -74,30 +78,17 @@ uint32_t crc32c_intel(unsigned char const *data, unsigned long length)
 	return crc;
 }
 
-static void do_cpuid(unsigned int *eax, unsigned int *ebx, unsigned int *ecx,
-		     unsigned int *edx)
+void crc32c_intel_probe(void)
 {
-	int id = *eax;
+	if (!crc32c_probed) {
+		unsigned int eax, ebx, ecx = 0, edx;
 
-	asm("movl %4, %%eax;"
-	    "cpuid;"
-	    "movl %%eax, %0;"
-	    "movl %%ebx, %1;"
-	    "movl %%ecx, %2;"
-	    "movl %%edx, %3;"
-		: "=r" (*eax), "=r" (*ebx), "=r" (*ecx), "=r" (*edx)
-		: "r" (id)
-		: "eax", "ebx", "ecx", "edx");
-}
+		eax = 1;
 
-int crc32c_intel_works(void)
-{
-	unsigned int eax, ebx, ecx, edx;
-
-	eax = 1;
-
-	do_cpuid(&eax, &ebx, &ecx, &edx);
-	return (ecx & (1 << 20)) != 0;
+		do_cpuid(&eax, &ebx, &ecx, &edx);
+		crc32c_intel_available = (ecx & (1 << 20)) != 0;
+		crc32c_probed = 1;
+	}
 }
 
 #endif /* ARCH_HAVE_SSE */

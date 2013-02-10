@@ -4,73 +4,54 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <time.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sys/mman.h>
 
+#include "fio.h"
 #include "log.h"
 #include "mutex.h"
 #include "arch/arch.h"
 #include "os/os.h"
 #include "helpers.h"
+#include "time.h"
+#include "gettime.h"
 
 void fio_mutex_remove(struct fio_mutex *mutex)
 {
-	close(mutex->mutex_fd);
+	pthread_cond_destroy(&mutex->cond);
 	munmap((void *) mutex, sizeof(*mutex));
 }
 
 struct fio_mutex *fio_mutex_init(int value)
 {
-	char mutex_name[] = "/tmp/.fio_mutex.XXXXXX";
 	struct fio_mutex *mutex = NULL;
 	pthread_mutexattr_t attr;
 	pthread_condattr_t cond;
-	int fd, ret, mflag;
-
-	fd = mkstemp(mutex_name);
-	if (fd < 0) {
-		perror("open mutex");
-		return NULL;
-	}
-
-#ifdef FIO_HAVE_FALLOCATE
-	posix_fallocate(fd, 0, sizeof(struct fio_mutex));
-#endif
-
-	if (ftruncate(fd, sizeof(struct fio_mutex)) < 0) {
-		perror("ftruncate mutex");
-		goto err;
-	}
+	int ret;
 
 	mutex = (void *) mmap(NULL, sizeof(struct fio_mutex),
-				PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+				PROT_READ | PROT_WRITE,
+				OS_MAP_ANON | MAP_SHARED, -1, 0);
 	if (mutex == MAP_FAILED) {
 		perror("mmap mutex");
-		close(fd);
 		mutex = NULL;
 		goto err;
 	}
 
-	unlink(mutex_name);
-	mutex->mutex_fd = fd;
 	mutex->value = value;
-
-	/*
-	 * Not all platforms support process shared mutexes (FreeBSD)
-	 */
-#ifdef FIO_HAVE_PSHARED_MUTEX
-	mflag = PTHREAD_PROCESS_SHARED;
-#else
-	mflag = PTHREAD_PROCESS_PRIVATE;
-#endif
 
 	ret = pthread_mutexattr_init(&attr);
 	if (ret) {
 		log_err("pthread_mutexattr_init: %s\n", strerror(ret));
 		goto err;
 	}
+
+	/*
+	 * Not all platforms support process shared mutexes (FreeBSD)
+	 */
 #ifdef FIO_HAVE_PSHARED_MUTEX
-	ret = pthread_mutexattr_setpshared(&attr, mflag);
+	ret = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
 	if (ret) {
 		log_err("pthread_mutexattr_setpshared: %s\n", strerror(ret));
 		goto err;
@@ -79,7 +60,7 @@ struct fio_mutex *fio_mutex_init(int value)
 
 	pthread_condattr_init(&cond);
 #ifdef FIO_HAVE_PSHARED_MUTEX
-	pthread_condattr_setpshared(&cond, mflag);
+	pthread_condattr_setpshared(&cond, PTHREAD_PROCESS_SHARED);
 #endif
 	pthread_cond_init(&mutex->cond, &cond);
 
@@ -97,23 +78,39 @@ err:
 	if (mutex)
 		fio_mutex_remove(mutex);
 
-	unlink(mutex_name);
 	return NULL;
+}
+
+static int mutex_timed_out(struct timeval *t, unsigned int seconds)
+{
+	return mtime_since_now(t) >= seconds * 1000;
 }
 
 int fio_mutex_down_timeout(struct fio_mutex *mutex, unsigned int seconds)
 {
+	struct timeval tv_s;
 	struct timespec t;
 	int ret = 0;
 
-	clock_gettime(CLOCK_REALTIME, &t);
-	t.tv_sec += seconds;
+	gettimeofday(&tv_s, NULL);
+	t.tv_sec = tv_s.tv_sec + seconds;
+	t.tv_nsec = tv_s.tv_usec * 1000;
 
 	pthread_mutex_lock(&mutex->lock);
 
 	while (!mutex->value && !ret) {
 		mutex->waiters++;
+
+		/*
+		 * Some platforms (FreeBSD 9?) seems to return timed out
+		 * way too early, double check.
+		 */
 		ret = pthread_cond_timedwait(&mutex->cond, &mutex->lock, &t);
+		if (ret == ETIMEDOUT && !mutex_timed_out(&tv_s, seconds)) {
+			pthread_mutex_lock(&mutex->lock);
+			ret = 0;
+		}
+
 		mutex->waiters--;
 	}
 

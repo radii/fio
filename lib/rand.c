@@ -33,30 +33,37 @@
 
 */
 
+#include <string.h>
 #include "rand.h"
 #include "../hash.h"
-
-struct frand_state __fio_rand_state;
 
 static inline int __seed(unsigned int x, unsigned int m)
 {
 	return (x < m) ? x + m : x;
 }
 
+static void __init_rand(struct frand_state *state, unsigned int seed)
+{
+	int cranks = 6;
+
+#define LCG(x, seed)  ((x) * 69069 ^ (seed))
+
+	state->s1 = __seed(LCG((2^31) + (2^17) + (2^7), seed), 1);
+	state->s2 = __seed(LCG(state->s1, seed), 7);
+	state->s3 = __seed(LCG(state->s2, seed), 15);
+
+	while (cranks--)
+		__rand(state);
+}
+
 void init_rand(struct frand_state *state)
 {
-#define LCG(x)  ((x) * 69069)   /* super-duper LCG */
+	__init_rand(state, 1);
+}
 
-	state->s1 = __seed(LCG((2^31) + (2^17) + (2^7)), 1);
-	state->s2 = __seed(LCG(state->s1), 7);
-	state->s3 = __seed(LCG(state->s2), 15);
-
-	__rand(state);
-	__rand(state);
-	__rand(state);
-	__rand(state);
-	__rand(state);
-	__rand(state);
+void init_rand_seed(struct frand_state *state, unsigned int seed)
+{
+	__init_rand(state, seed);
 }
 
 void __fill_random_buf(void *buf, unsigned int len, unsigned long seed)
@@ -71,13 +78,56 @@ void __fill_random_buf(void *buf, unsigned int len, unsigned long seed)
 	}
 }
 
-unsigned long fill_random_buf(void *buf, unsigned int len)
+unsigned long fill_random_buf(struct frand_state *fs, void *buf,
+			      unsigned int len)
 {
-	unsigned long r = __rand(&__fio_rand_state);
+	unsigned long r = __rand(fs);
 
 	if (sizeof(int) != sizeof(long *))
-		r *= (unsigned long) __rand(&__fio_rand_state);
+		r *= (unsigned long) __rand(fs);
 
 	__fill_random_buf(buf, len, r);
+	return r;
+}
+
+unsigned long fill_random_buf_percentage(struct frand_state *fs, void *buf,
+					 unsigned int percentage,
+					 unsigned int segment, unsigned int len)
+{
+	unsigned long r = __rand(fs);
+	unsigned int this_len;
+
+	if (percentage == 100) {
+		memset(buf, 0, len);
+		return 0;
+	}
+
+	if (segment > len)
+		segment = len;
+
+	if (sizeof(int) != sizeof(long *))
+		r *= (unsigned long) __rand(fs);
+
+	while (len) {
+		/*
+		 * Fill random chunk
+		 */
+		this_len = (segment * (100 - percentage)) / 100;
+		if (this_len > len)
+			this_len = len;
+
+		__fill_random_buf(buf, this_len, r);
+
+		len -= this_len;
+		buf += this_len;
+
+		if (this_len > len)
+			this_len = len;
+
+		memset(buf, 0, this_len);
+		len -= this_len;
+		buf += this_len;
+	}
+
 	return r;
 }

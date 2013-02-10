@@ -7,7 +7,7 @@
 
 #include "fio.h"
 
-static char run_str[MAX_JOBS + 1];
+static char run_str[REAL_MAX_JOBS + 1];
 
 /*
  * Sets the status of the 'td' in the printed status map.
@@ -18,7 +18,12 @@ static void check_str_update(struct thread_data *td)
 
 	switch (td->runstate) {
 	case TD_REAPED:
-		c = '_';
+		if (td->error)
+			c = 'X';
+		else if (td->sig)
+			c = 'K';
+		else
+			c = '_';
 		break;
 	case TD_EXITED:
 		c = 'E';
@@ -28,20 +33,36 @@ static void check_str_update(struct thread_data *td)
 		break;
 	case TD_RUNNING:
 		if (td_rw(td)) {
-			if (td_random(td))
-				c = 'm';
-			else
-				c = 'M';
+			if (td_random(td)) {
+				if (td->o.rwmix[DDIR_READ] == 100)
+					c = 'r';
+				else if (td->o.rwmix[DDIR_WRITE] == 100)
+					c = 'w';
+				else
+					c = 'm';
+			} else {
+				if (td->o.rwmix[DDIR_READ] == 100)
+					c = 'R';
+				else if (td->o.rwmix[DDIR_WRITE] == 100)
+					c = 'W';
+				else
+					c = 'M';
+			}
 		} else if (td_read(td)) {
 			if (td_random(td))
 				c = 'r';
 			else
 				c = 'R';
-		} else {
+		} else if (td_write(td)) {
 			if (td_random(td))
 				c = 'w';
 			else
 				c = 'W';
+		} else {
+			if (td_random(td))
+				c = 'd';
+			else
+				c = 'D';
 		}
 		break;
 	case TD_PRE_READING:
@@ -57,6 +78,7 @@ static void check_str_update(struct thread_data *td)
 		c = 'C';
 		break;
 	case TD_INITIALIZED:
+	case TD_SETTING_UP:
 		c = 'I';
 		break;
 	case TD_NOT_CREATED:
@@ -117,24 +139,36 @@ static int thread_eta(struct thread_data *td)
 		bytes_total = td->fill_device_size;
 	}
 
-	/*
-	 * if writing, bytes_total will be twice the size. If mixing,
-	 * assume a 50/50 split and thus bytes_total will be 50% larger.
-	 */
-	if (td->o.do_verify && td->o.verify && td_write(td)) {
-		if (td_rw(td))
-			bytes_total = bytes_total * 3 / 2;
-		else
-			bytes_total <<= 1;
+	if (td->o.zone_size && td->o.zone_skip && bytes_total) {
+		unsigned int nr_zones;
+		uint64_t zone_bytes;
+
+		zone_bytes = bytes_total + td->o.zone_size + td->o.zone_skip;
+		nr_zones = (zone_bytes - 1) / (td->o.zone_size + td->o.zone_skip);
+		bytes_total -= nr_zones * td->o.zone_skip;
 	}
 
-	if (td->o.zone_size && td->o.zone_skip)
-		bytes_total /= (td->o.zone_skip / td->o.zone_size);
+	/*
+	 * if writing and verifying afterwards, bytes_total will be twice the
+	 * size. In a mixed workload, verify phase will be the size of the
+	 * first stage writes.
+	 */
+	if (td->o.do_verify && td->o.verify && td_write(td)) {
+		if (td_rw(td)) {
+			unsigned int perc = 50;
+
+			if (td->o.rwmix[DDIR_WRITE])
+				perc = td->o.rwmix[DDIR_WRITE];
+
+			bytes_total += (bytes_total * perc) / 100;
+		} else
+			bytes_total <<= 1;
+	}
 
 	if (td->runstate == TD_RUNNING || td->runstate == TD_VERIFYING) {
 		double perc, perc_t;
 
-		bytes_done = td->io_bytes[DDIR_READ] + td->io_bytes[DDIR_WRITE];
+		bytes_done = ddir_rw_sum(td->io_bytes);
 		perc = (double) bytes_done / (double) bytes_total;
 		if (perc > 1.0)
 			perc = 1.0;
@@ -155,6 +189,7 @@ static int thread_eta(struct thread_data *td)
 			|| td->runstate == TD_RAMP
 			|| td->runstate == TD_PRE_READING) {
 		int t_eta = 0, r_eta = 0;
+		unsigned long long rate_bytes;
 
 		/*
 		 * We can only guess - assume it'll run the full timeout
@@ -173,9 +208,9 @@ static int thread_eta(struct thread_data *td)
 					t_eta -= ramp_left;
 			}
 		}
-		if (td->o.rate[0] || td->o.rate[1]) {
-			r_eta = (bytes_total / 1024) /
-					(td->o.rate[0] + td->o.rate[1]);
+		rate_bytes = ddir_rw_sum(td->o.rate);
+		if (rate_bytes) {
+			r_eta = (bytes_total / 1024) / rate_bytes;
 			r_eta += td->o.start_delay;
 		}
 
@@ -197,89 +232,128 @@ static int thread_eta(struct thread_data *td)
 	return eta_sec;
 }
 
-static void calc_rate(unsigned long mtime, unsigned long long *io_bytes,
+static void calc_rate(int unified_rw_rep, unsigned long mtime,
+		      unsigned long long *io_bytes,
 		      unsigned long long *prev_io_bytes, unsigned int *rate)
 {
-	rate[0] = (io_bytes[0] - prev_io_bytes[0]) / mtime;
-	rate[1] = (io_bytes[1] - prev_io_bytes[1]) / mtime;
-	prev_io_bytes[0] = io_bytes[0];
-	prev_io_bytes[1] = io_bytes[1];
+	int i;
+
+	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
+		unsigned long long diff;
+
+		diff = io_bytes[i] - prev_io_bytes[i];
+		if (unified_rw_rep) {
+			rate[i] = 0;
+			rate[0] += ((1000 * diff) / mtime) / 1024;
+		} else
+			rate[i] = ((1000 * diff) / mtime) / 1024;
+
+		prev_io_bytes[i] = io_bytes[i];
+	}
 }
 
-static void calc_iops(unsigned long mtime, unsigned long long *io_iops,
+static void calc_iops(int unified_rw_rep, unsigned long mtime,
+		      unsigned long long *io_iops,
 		      unsigned long long *prev_io_iops, unsigned int *iops)
 {
-	iops[0] = ((io_iops[0] - prev_io_iops[0]) * 1000) / mtime;
-	iops[1] = ((io_iops[1] - prev_io_iops[1]) * 1000) / mtime;
-	prev_io_iops[0] = io_iops[0];
-	prev_io_iops[1] = io_iops[1];
+	int i;
+
+	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
+		unsigned long long diff;
+
+		diff = io_iops[i] - prev_io_iops[i];
+		if (unified_rw_rep) {
+			iops[i] = 0;
+			iops[0] += (diff * 1000) / mtime;
+		} else
+			iops[i] = (diff * 1000) / mtime;
+
+		prev_io_iops[i] = io_iops[i];
+	}
 }
 
 /*
  * Print status of the jobs we know about. This includes rate estimates,
  * ETA, thread state, etc.
  */
-void print_thread_status(void)
+int calc_thread_status(struct jobs_eta *je, int force)
 {
-	unsigned long elapsed = (mtime_since_genesis() + 999) / 1000;
-	int i, nr_ramp, nr_running, nr_pending, t_rate, m_rate;
-	int t_iops, m_iops, files_open;
 	struct thread_data *td;
-	char eta_str[128];
-	double perc = 0.0;
-	unsigned long long io_bytes[2], io_iops[2];
-	unsigned long rate_time, disp_time, bw_avg_time, *eta_secs, eta_sec;
+	int i, unified_rw_rep;
+	unsigned long rate_time, disp_time, bw_avg_time, *eta_secs;
+	unsigned long long io_bytes[DDIR_RWDIR_CNT];
+	unsigned long long io_iops[DDIR_RWDIR_CNT];
 	struct timeval now;
 
-	static unsigned long long rate_io_bytes[2];
-	static unsigned long long disp_io_bytes[2];
-	static unsigned long long disp_io_iops[2];
+	static unsigned long long rate_io_bytes[DDIR_RWDIR_CNT];
+	static unsigned long long disp_io_bytes[DDIR_RWDIR_CNT];
+	static unsigned long long disp_io_iops[DDIR_RWDIR_CNT];
 	static struct timeval rate_prev_time, disp_prev_time;
-	static unsigned int rate[2], iops[2];
-	static int linelen_last;
-	static int eta_good;
-	int i2p = 0;
 
-	if (temp_stall_ts || terse_output || eta_print == FIO_ETA_NEVER)
-		return;
+	if (!force) {
+		if (output_format != FIO_OUTPUT_NORMAL &&
+		    f_out == stdout)
+			return 0;
+		if (temp_stall_ts || eta_print == FIO_ETA_NEVER)
+			return 0;
 
-	if (!isatty(STDOUT_FILENO) && (eta_print != FIO_ETA_ALWAYS))
-		return;
+		if (!isatty(STDOUT_FILENO) && (eta_print != FIO_ETA_ALWAYS))
+			return 0;
+	}
 
-	if (!rate_io_bytes[0] && !rate_io_bytes[1])
+	if (!ddir_rw_sum(rate_io_bytes))
 		fill_start_time(&rate_prev_time);
-	if (!disp_io_bytes[0] && !disp_io_bytes[1])
+	if (!ddir_rw_sum(disp_io_bytes))
 		fill_start_time(&disp_prev_time);
 
 	eta_secs = malloc(thread_number * sizeof(unsigned long));
 	memset(eta_secs, 0, thread_number * sizeof(unsigned long));
 
-	io_bytes[0] = io_bytes[1] = 0;
-	io_iops[0] = io_iops[1] = 0;
-	nr_pending = nr_running = t_rate = m_rate = t_iops = m_iops = 0;
-	nr_ramp = 0;
+	je->elapsed_sec = (mtime_since_genesis() + 999) / 1000;
+
+	io_bytes[DDIR_READ] = io_bytes[DDIR_WRITE] = io_bytes[DDIR_TRIM] = 0;
+	io_iops[DDIR_READ] = io_iops[DDIR_WRITE] = io_iops[DDIR_TRIM] = 0;
 	bw_avg_time = ULONG_MAX;
-	files_open = 0;
+	unified_rw_rep = 0;
 	for_each_td(td, i) {
+		unified_rw_rep += td->o.unified_rw_rep;
+		if (is_power_of_2(td->o.kb_base))
+			je->is_pow2 = 1;
 		if (td->o.bw_avg_time < bw_avg_time)
 			bw_avg_time = td->o.bw_avg_time;
 		if (td->runstate == TD_RUNNING || td->runstate == TD_VERIFYING
 		    || td->runstate == TD_FSYNCING
 		    || td->runstate == TD_PRE_READING) {
-			nr_running++;
-			t_rate += td->o.rate[0] + td->o.rate[1];
-			m_rate += td->o.ratemin[0] + td->o.ratemin[1];
-			t_iops += td->o.rate_iops[0] + td->o.rate_iops[1];
-			m_iops += td->o.rate_iops_min[0] +
-					td->o.rate_iops_min[1];
-			files_open += td->nr_open_files;
-		} else if (td->runstate == TD_RAMP) {
-			nr_running++;
-			nr_ramp++;
-		} else if (td->runstate < TD_RUNNING)
-			nr_pending++;
+			je->nr_running++;
+			if (td_read(td)) {
+				je->t_rate += td->o.rate[DDIR_READ];
+				je->t_iops += td->o.rate_iops[DDIR_READ];
+				je->m_rate += td->o.ratemin[DDIR_READ];
+				je->m_iops += td->o.rate_iops_min[DDIR_READ];
+			}
+			if (td_write(td)) {
+				je->t_rate += td->o.rate[DDIR_WRITE];
+				je->t_iops += td->o.rate_iops[DDIR_WRITE];
+				je->m_rate += td->o.ratemin[DDIR_WRITE];
+				je->m_iops += td->o.rate_iops_min[DDIR_WRITE];
+			}
+			if (td_trim(td)) {
+				je->t_rate += td->o.rate[DDIR_TRIM];
+				je->t_iops += td->o.rate_iops[DDIR_TRIM];
+				je->m_rate += td->o.ratemin[DDIR_TRIM];
+				je->m_iops += td->o.rate_iops_min[DDIR_TRIM];
+			}
 
-		if (elapsed >= 3)
+			je->files_open += td->nr_open_files;
+		} else if (td->runstate == TD_RAMP) {
+			je->nr_running++;
+			je->nr_ramp++;
+		} else if (td->runstate == TD_SETTING_UP)
+			je->nr_running++;
+		else if (td->runstate < TD_RUNNING)
+			je->nr_pending++;
+
+		if (je->elapsed_sec >= 3)
 			eta_secs[i] = thread_eta(td);
 		else
 			eta_secs[i] = INT_MAX;
@@ -287,45 +361,47 @@ void print_thread_status(void)
 		check_str_update(td);
 
 		if (td->runstate > TD_RAMP) {
-			io_bytes[0] += td->io_bytes[0];
-			io_bytes[1] += td->io_bytes[1];
-			io_iops[0] += td->io_blocks[0];
-			io_iops[1] += td->io_blocks[1];
+			int ddir;
+
+			for (ddir = DDIR_READ; ddir < DDIR_RWDIR_CNT; ddir++) {
+				if (unified_rw_rep) {
+					io_bytes[0] += td->io_bytes[ddir];
+					io_iops[0] += td->io_blocks[ddir];
+				} else {
+					io_bytes[ddir] += td->io_bytes[ddir];
+					io_iops[ddir] += td->io_blocks[ddir];
+				}
+			}
 		}
 	}
 
 	if (exitall_on_terminate)
-		eta_sec = INT_MAX;
+		je->eta_sec = INT_MAX;
 	else
-		eta_sec = 0;
+		je->eta_sec = 0;
 
 	for_each_td(td, i) {
-		if (!i2p && is_power_of_2(td->o.kb_base))
-			i2p = 1;
 		if (exitall_on_terminate) {
-			if (eta_secs[i] < eta_sec)
-				eta_sec = eta_secs[i];
+			if (eta_secs[i] < je->eta_sec)
+				je->eta_sec = eta_secs[i];
 		} else {
-			if (eta_secs[i] > eta_sec)
-				eta_sec = eta_secs[i];
+			if (eta_secs[i] > je->eta_sec)
+				je->eta_sec = eta_secs[i];
 		}
 	}
 
 	free(eta_secs);
 
-	if (eta_sec != INT_MAX && elapsed) {
-		perc = (double) elapsed / (double) (elapsed + eta_sec);
-		eta_to_str(eta_str, eta_sec);
-	}
-
 	fio_gettime(&now, NULL);
 	rate_time = mtime_since(&rate_prev_time, &now);
 
 	if (write_bw_log && rate_time > bw_avg_time && !in_ramp_time(td)) {
-		calc_rate(rate_time, io_bytes, rate_io_bytes, rate);
+		calc_rate(unified_rw_rep, rate_time, io_bytes, rate_io_bytes,
+				je->rate);
 		memcpy(&rate_prev_time, &now, sizeof(now));
-		add_agg_sample(rate[DDIR_READ], DDIR_READ, 0);
-		add_agg_sample(rate[DDIR_WRITE], DDIR_WRITE, 0);
+		add_agg_sample(je->rate[DDIR_READ], DDIR_READ, 0);
+		add_agg_sample(je->rate[DDIR_WRITE], DDIR_WRITE, 0);
+		add_agg_sample(je->rate[DDIR_TRIM], DDIR_TRIM, 0);
 	}
 
 	disp_time = mtime_since(&disp_prev_time, &now);
@@ -333,35 +409,56 @@ void print_thread_status(void)
 	/*
 	 * Allow a little slack, the target is to print it every 1000 msecs
 	 */
-	if (disp_time < 900)
-		return;
+	if (!force && disp_time < 900)
+		return 0;
 
-	calc_rate(disp_time, io_bytes, disp_io_bytes, rate);
-	calc_iops(disp_time, io_iops, disp_io_iops, iops);
+	calc_rate(unified_rw_rep, disp_time, io_bytes, disp_io_bytes, je->rate);
+	calc_iops(unified_rw_rep, disp_time, io_iops, disp_io_iops, je->iops);
 
 	memcpy(&disp_prev_time, &now, sizeof(now));
 
-	if (!nr_running && !nr_pending)
-		return;
+	if (!force && !je->nr_running && !je->nr_pending)
+		return 0;
 
-	printf("Jobs: %d (f=%d)", nr_running, files_open);
-	if (m_rate || t_rate) {
+	je->nr_threads = thread_number;
+	memcpy(je->run_str, run_str, thread_number * sizeof(char));
+
+	return 1;
+}
+
+void display_thread_status(struct jobs_eta *je)
+{
+	static int linelen_last;
+	static int eta_good;
+	char output[REAL_MAX_JOBS + 512], *p = output;
+	char eta_str[128];
+	double perc = 0.0;
+
+	if (je->eta_sec != INT_MAX && je->elapsed_sec) {
+		perc = (double) je->elapsed_sec / (double) (je->elapsed_sec + je->eta_sec);
+		eta_to_str(eta_str, je->eta_sec);
+	}
+
+	p += sprintf(p, "Jobs: %d (f=%d)", je->nr_running, je->files_open);
+	if (je->m_rate || je->t_rate) {
 		char *tr, *mr;
 
-		mr = num2str(m_rate, 4, 0, i2p);
-		tr = num2str(t_rate, 4, 0, i2p);
-		printf(", CR=%s/%s KB/s", tr, mr);
+		mr = num2str(je->m_rate, 4, 0, je->is_pow2);
+		tr = num2str(je->t_rate, 4, 0, je->is_pow2);
+		p += sprintf(p, ", CR=%s/%s KB/s", tr, mr);
 		free(tr);
 		free(mr);
-	} else if (m_iops || t_iops)
-		printf(", CR=%d/%d IOPS", t_iops, m_iops);
-	if (eta_sec != INT_MAX && nr_running) {
+	} else if (je->m_iops || je->t_iops)
+		p += sprintf(p, ", CR=%d/%d IOPS", je->t_iops, je->m_iops);
+	if (je->eta_sec != INT_MAX && je->nr_running) {
 		char perc_str[32];
-		char *iops_str[2];
-		char *rate_str[2];
+		char *iops_str[DDIR_RWDIR_CNT];
+		char *rate_str[DDIR_RWDIR_CNT];
+		size_t left;
 		int l;
+		int ddir;
 
-		if ((!eta_sec && !eta_good) || nr_ramp == nr_running)
+		if ((!je->eta_sec && !eta_good) || je->nr_ramp == je->nr_running)
 			strcpy(perc_str, "-.-% done");
 		else {
 			eta_good = 1;
@@ -369,26 +466,51 @@ void print_thread_status(void)
 			sprintf(perc_str, "%3.1f%% done", perc);
 		}
 
-		rate_str[0] = num2str(rate[0], 5, 10, i2p);
-		rate_str[1] = num2str(rate[1], 5, 10, i2p);
+		for (ddir = DDIR_READ; ddir < DDIR_RWDIR_CNT; ddir++) {
+			rate_str[ddir] = num2str(je->rate[ddir], 5,
+						1024, je->is_pow2);
+			iops_str[ddir] = num2str(je->iops[ddir], 4, 1, 0);
+		}
 
-		iops_str[0] = num2str(iops[0], 4, 1, 0);
-		iops_str[1] = num2str(iops[1], 4, 1, 0);
+		left = sizeof(output) - (p - output) - 1;
 
-		l = printf(": [%s] [%s] [%s/%s /s] [%s/%s iops] [eta %s]",
-				 run_str, perc_str, rate_str[0], rate_str[1],
-				 iops_str[0], iops_str[1], eta_str);
+		l = snprintf(p, left, ": [%s] [%s] [%s/%s/%s /s] [%s/%s/%s iops] [eta %s]",
+				je->run_str, perc_str, rate_str[DDIR_READ],
+				rate_str[DDIR_WRITE], rate_str[DDIR_TRIM],
+				iops_str[DDIR_READ], iops_str[DDIR_WRITE],
+				iops_str[DDIR_TRIM], eta_str);
+		p += l;
 		if (l >= 0 && l < linelen_last)
-			printf("%*s", linelen_last - l, "");
+			p += sprintf(p, "%*s", linelen_last - l, "");
 		linelen_last = l;
 
-		free(rate_str[0]);
-		free(rate_str[1]);
-		free(iops_str[0]);
-		free(iops_str[1]);
+		for (ddir = DDIR_READ; ddir < DDIR_RWDIR_CNT; ddir++) {
+			free(rate_str[ddir]);
+			free(iops_str[ddir]);
+		}
 	}
-	printf("\r");
+	p += sprintf(p, "\r");
+
+	printf("%s", output);
 	fflush(stdout);
+}
+
+void print_thread_status(void)
+{
+	struct jobs_eta *je;
+	size_t size;
+
+	if (!thread_number)
+		return;
+
+	size = sizeof(*je) + thread_number * sizeof(char) + 1;
+	je = malloc(size);
+	memset(je, 0, size);
+
+	if (calc_thread_status(je, 0))
+		display_thread_status(je);
+
+	free(je);
 }
 
 void print_status_init(int thr_number)

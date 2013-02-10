@@ -5,7 +5,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifndef FIO_NO_HAVE_SHM_H
 #include <sys/shm.h>
+#endif
 #include <sys/mman.h>
 
 #include "fio.h"
@@ -115,11 +117,20 @@ static void free_mem_shm(struct thread_data *td)
 	shmctl(td->shm_id, IPC_RMID, &sbuf);
 }
 
-static int alloc_mem_mmap(struct thread_data *td, unsigned int total_mem)
+static int alloc_mem_mmap(struct thread_data *td, size_t total_mem)
 {
-	int flags = MAP_PRIVATE;
+	int flags = 0;
 
 	td->mmapfd = 1;
+
+	if (td->o.mem_type == MEM_MMAPHUGE) {
+		unsigned long mask = td->o.hugepage_size - 1;
+
+		/* TODO: make sure the file is a real hugetlbfs file */
+		if (!td->mmapfile)
+			flags |= MAP_HUGETLB;
+		total_mem = (total_mem + mask) & ~mask;
+	}
 
 	if (td->mmapfile) {
 		td->mmapfd = open(td->mmapfile, O_RDWR|O_CREAT, 0644);
@@ -129,13 +140,18 @@ static int alloc_mem_mmap(struct thread_data *td, unsigned int total_mem)
 			td->orig_buffer = NULL;
 			return 1;
 		}
-		if (ftruncate(td->mmapfd, total_mem) < 0) {
+		if (td->o.mem_type != MEM_MMAPHUGE &&
+		    ftruncate(td->mmapfd, total_mem) < 0) {
 			td_verror(td, errno, "truncate mmap file");
 			td->orig_buffer = NULL;
 			return 1;
 		}
+		if (td->o.mem_type == MEM_MMAPHUGE)
+			flags |= MAP_SHARED;
+		else
+			flags |= MAP_PRIVATE;
 	} else
-		flags |= OS_MAP_ANON;
+		flags |= OS_MAP_ANON | MAP_PRIVATE;
 
 	td->orig_buffer = mmap(NULL, total_mem, PROT_READ | PROT_WRITE, flags,
 				td->mmapfd, 0);
@@ -155,7 +171,7 @@ static int alloc_mem_mmap(struct thread_data *td, unsigned int total_mem)
 	return 0;
 }
 
-static void free_mem_mmap(struct thread_data *td, unsigned int total_mem)
+static void free_mem_mmap(struct thread_data *td, size_t total_mem)
 {
 	dprint(FD_MEM, "munmap %u %p\n", total_mem, td->orig_buffer);
 	munmap(td->orig_buffer, td->orig_buffer_size);
@@ -166,7 +182,7 @@ static void free_mem_mmap(struct thread_data *td, unsigned int total_mem)
 	}
 }
 
-static int alloc_mem_malloc(struct thread_data *td, unsigned int total_mem)
+static int alloc_mem_malloc(struct thread_data *td, size_t total_mem)
 {
 	td->orig_buffer = malloc(total_mem);
 	dprint(FD_MEM, "malloc %u %p\n", total_mem, td->orig_buffer);
@@ -185,7 +201,7 @@ static void free_mem_malloc(struct thread_data *td)
  */
 int allocate_io_mem(struct thread_data *td)
 {
-	unsigned int total_mem;
+	size_t total_mem;
 	int ret = 0;
 
 	if (td->io_ops->flags & FIO_NOIO)
@@ -199,6 +215,8 @@ int allocate_io_mem(struct thread_data *td)
 		if (td->o.mem_align && td->o.mem_align > page_size)
 			total_mem += td->o.mem_align - page_size;
 	}
+
+	dprint(FD_MEM, "Alloc %lu for buffers\n", (size_t) total_mem);
 
 	if (td->o.mem_type == MEM_MALLOC)
 		ret = alloc_mem_malloc(td, total_mem);
